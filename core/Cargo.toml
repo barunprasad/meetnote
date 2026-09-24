@@ -1,0 +1,14 @@
+[package]
+name = "meetnote-core"
+version = "0.1.0"
+edition = "2021"
+description = "Storage and domain types shared by the meetnote app and its MCP server."
+
+[dependencies]
+# `bundled` compiles SQLite in — no system dependency, and the version is pinned
+# to what we test against rather than whatever macOS ships.
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }

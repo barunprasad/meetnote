@@ -1,0 +1,859 @@
+<title>meetnote</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+
+<style>
+  /* Dark-first: the panel floats over video calls, where a light surface
+     glares. Light theme follows the system setting or an explicit choice. */
+  :root {
+    --ink:      #14181d;
+    --raised:   #1c222a;
+    --sunk:     #10141a;
+    --line:     #2b333d;
+    --line-soft:#232a32;
+    --text:     #e6e9ec;
+    --muted:    #7f8a96;
+    --faint:    #58626d;
+    /* The only chromatic value. It appears when audio is live and nowhere
+       else, so colour itself means "this is recording". */
+    --signal:   #e0a64a;
+    --signal-dim: rgba(224, 166, 74, 0.16);
+    --alarm:    #d4705f;
+    --shadow:   0 24px 60px -12px rgb(0 0 0 / .7), 0 2px 8px rgb(0 0 0 / .4);
+
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
+    --prose: ui-serif, "New York", Georgia, serif;
+    --ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --ink:#edeeec; --raised:#f8f8f6; --sunk:#e4e5e2; --line:#d5d7d2;
+      --line-soft:#e2e4df; --text:#191c20; --muted:#666e76; --faint:#969ea5;
+      --signal:#9c6410; --signal-dim:rgba(156,100,16,.14); --alarm:#a8412e;
+      --shadow:0 24px 50px -16px rgb(0 0 0 / .18), 0 1px 3px rgb(0 0 0 / .08);
+    }
+  }
+  :root[data-theme="light"] {
+    --ink:#edeeec; --raised:#f8f8f6; --sunk:#e4e5e2; --line:#d5d7d2;
+    --line-soft:#e2e4df; --text:#191c20; --muted:#666e76; --faint:#969ea5;
+    --signal:#9c6410; --signal-dim:rgba(156,100,16,.14); --alarm:#a8412e;
+    --shadow:0 24px 50px -16px rgb(0 0 0 / .18), 0 1px 3px rgb(0 0 0 / .08);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: clamp(1.25rem,3.5vw,3rem) clamp(1rem,3.5vw,2.5rem) 4rem;
+    background: var(--ink); color: var(--text);
+    font-family: var(--ui); -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 74rem; margin: 0 auto; }
+
+  .eyebrow {
+    font-family: var(--mono); font-size: .6875rem; letter-spacing: .14em;
+    text-transform: uppercase; color: var(--faint); margin: 0 0 .7rem;
+  }
+  .masthead h1 {
+    font-family: var(--prose); font-weight: 500;
+    font-size: clamp(1.4rem,3vw,2rem); line-height: 1.15; letter-spacing: -.01em;
+    margin: 0 0 .55rem; text-wrap: balance; max-width: 26ch;
+  }
+  .masthead > p {
+    margin: 0; max-width: 60ch; font-size: .9375rem; line-height: 1.6; color: var(--muted);
+  }
+
+  /* ── screen switcher ─────────────────────────────────────────── */
+  nav.screens {
+    display: flex; flex-wrap: wrap; gap: .25rem;
+    margin: 2rem 0 1.5rem; padding-bottom: .75rem;
+    border-bottom: 1px solid var(--line);
+  }
+  nav.screens button {
+    font-family: var(--mono); font-size: .75rem; letter-spacing: .02em;
+    color: var(--muted); background: none; border: 0; border-radius: 6px;
+    padding: .375rem .625rem; cursor: pointer;
+  }
+  nav.screens button:hover { color: var(--text); background: var(--raised); }
+  nav.screens button[aria-current="true"] { color: var(--ink); background: var(--text); }
+  nav.screens button:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
+
+  .screen { display: none; }
+  .screen[data-active] { display: block; animation: in 220ms ease-out both; }
+  @keyframes in { from { opacity: 0; transform: translateY(3px); } }
+
+  .caption {
+    font-family: var(--mono); font-size: .6875rem; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--faint); margin: 0 0 .75rem;
+  }
+  .note-under {
+    font-size: .8125rem; line-height: 1.55; color: var(--faint);
+    margin: 1rem 0 0; max-width: 46ch;
+  }
+
+  /* ── desktop window chrome ───────────────────────────────────── */
+  .window {
+    background: var(--raised); border: 1px solid var(--line);
+    border-radius: 10px; box-shadow: var(--shadow); overflow: hidden;
+  }
+  .titlebar {
+    display: flex; align-items: center; gap: .5rem;
+    padding: .625rem .875rem; border-bottom: 1px solid var(--line-soft);
+    background: var(--sunk);
+  }
+  .lights { display: flex; gap: 6px; }
+  .lights i { width: 11px; height: 11px; border-radius: 50%; background: var(--line); display: block; }
+  .titlebar h2 {
+    font-size: .75rem; font-weight: 500; color: var(--muted);
+    margin: 0 auto; padding-right: 3rem; letter-spacing: .01em;
+  }
+
+  .body { display: grid; grid-template-columns: 13rem minmax(0,1fr); min-height: 30rem; }
+  @media (max-width: 46rem) { .body { grid-template-columns: minmax(0,1fr); } .rail { display: none; } }
+  .rail { border-right: 1px solid var(--line-soft); padding: .875rem .625rem; background: var(--sunk); }
+  .rail-group + .rail-group { margin-top: 1.25rem; }
+  .rail h3 {
+    font-family: var(--mono); font-size: .625rem; letter-spacing: .12em;
+    text-transform: uppercase; color: var(--faint); font-weight: 400;
+    margin: 0 0 .5rem; padding-left: .5rem;
+  }
+  .rail a {
+    display: flex; align-items: center; justify-content: space-between; gap: .5rem;
+    padding: .375rem .5rem; border-radius: 6px; text-decoration: none;
+    color: var(--muted); font-size: .8125rem;
+  }
+  .rail a[aria-current] { background: var(--raised); color: var(--text); }
+  .rail a b { font-weight: 400; }
+  .rail a span {
+    font-family: var(--mono); font-size: .6875rem; color: var(--faint);
+    font-variant-numeric: tabular-nums;
+  }
+  .pane { padding: clamp(1.25rem,2.5vw,2rem); min-width: 0; }
+
+  /* ── library ─────────────────────────────────────────────────── */
+  .lib { display: grid; gap: .25rem; }
+  .row {
+    display: grid; grid-template-columns: 5.5rem minmax(0,1fr) auto;
+    gap: 1rem; align-items: baseline;
+    padding: .875rem .75rem; border-radius: 8px; cursor: pointer;
+    border: 1px solid transparent;
+  }
+  .row:hover { background: var(--sunk); }
+  .row[aria-current] { background: var(--sunk); border-color: var(--line); }
+  .row .when {
+    font-family: var(--mono); font-size: .75rem; color: var(--faint);
+    font-variant-numeric: tabular-nums;
+  }
+  .row h4 { margin: 0 0 .3rem; font-size: .9375rem; font-weight: 500; letter-spacing: -.005em; }
+  /* The preview is the user's own fragments, not an AI summary — you find a
+     meeting again by what you thought was worth writing down. */
+  .row .frags {
+    font-family: var(--mono); font-size: .75rem; color: var(--muted);
+    line-height: 1.5; margin: 0;
+    display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .row .len { font-family: var(--mono); font-size: .6875rem; color: var(--faint); }
+
+  /* ── shared bits ─────────────────────────────────────────────── */
+  .pill {
+    display: inline-flex; align-items: center; gap: .375rem;
+    font-family: var(--mono); font-size: .625rem; letter-spacing: .06em;
+    text-transform: uppercase; padding: .1875rem .4375rem; border-radius: 4px;
+    border: 1px solid var(--line); color: var(--muted);
+  }
+  .pill.live { color: var(--signal); border-color: var(--signal-dim); }
+  .pill.warn { color: var(--alarm); border-color: var(--alarm); }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .dot.beat { animation: pulse 2.4s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: .3; } }
+
+  .bars { display: flex; gap: 2px; align-items: flex-end; height: 13px; }
+  .bars i { display: block; width: 2px; border-radius: 1px; background: var(--signal); height: 20%; transition: height 90ms linear; }
+
+  /* ── notes panel ─────────────────────────────────────────────── */
+  .panel { width: min(21rem, 100%); background: var(--raised); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); overflow: hidden; }
+  .panel-bar { display: flex; align-items: center; gap: .625rem; padding: .6875rem .875rem; border-bottom: 1px solid var(--line-soft); }
+  .elapsed { font-family: var(--mono); font-size: .75rem; font-variant-numeric: tabular-nums; }
+  .meters { margin-left: auto; display: flex; gap: .875rem; }
+  .meter { display: flex; align-items: center; gap: .375rem; }
+  .meter span { font-family: var(--mono); font-size: .625rem; color: var(--faint); }
+  .fragments { list-style: none; margin: 0; padding: .5rem 0; min-height: 13rem; }
+  .fragments li {
+    display: grid; grid-template-columns: 3.5rem minmax(0,1fr); gap: .625rem;
+    padding: .3125rem .875rem; font-family: var(--mono); font-size: .8125rem; line-height: 1.5;
+  }
+  .fragments time { color: var(--faint); font-variant-numeric: tabular-nums; }
+  .composer {
+    border-top: 1px solid var(--line-soft); background: var(--sunk); padding: .75rem .875rem;
+    display: grid; grid-template-columns: 3.5rem minmax(0,1fr); gap: .625rem; align-items: baseline;
+  }
+  .composer time { font-family: var(--mono); font-size: .8125rem; color: var(--signal); font-variant-numeric: tabular-nums; }
+  .caret { font-family: var(--mono); font-size: .8125rem; color: var(--muted); }
+  .caret::after {
+    content: ""; display: inline-block; width: 1px; height: .95em; background: var(--text);
+    margin-left: 1px; vertical-align: -.12em; animation: blink 1.1s steps(1) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  /* ── menu bar dropdown ───────────────────────────────────────── */
+  .menubar { width: min(17rem,100%); background: var(--raised); border: 1px solid var(--line); border-radius: 8px; box-shadow: var(--shadow); overflow: hidden; }
+  .menubar .head { padding: .75rem .875rem; border-bottom: 1px solid var(--line-soft); }
+  .menubar .head p { margin: 0; font-size: .8125rem; color: var(--muted); }
+  .menubar .action {
+    display: flex; width: 100%; align-items: center; gap: .5rem; text-align: left;
+    padding: .625rem .875rem; background: none; border: 0; color: var(--text);
+    font: inherit; font-size: .875rem; cursor: pointer;
+  }
+  .menubar .action:hover { background: var(--sunk); }
+  .menubar .action:focus-visible { outline: 2px solid var(--signal); outline-offset: -2px; }
+  .menubar .recent { border-top: 1px solid var(--line-soft); padding: .625rem .875rem; }
+  .menubar .recent p { margin: 0 0 .25rem; font-family: var(--mono); font-size: .6875rem; color: var(--faint); }
+  .menubar .recent a { color: var(--muted); font-size: .8125rem; text-decoration: none; }
+  .menubar .recent a:hover { color: var(--text); }
+
+  /* ── capture check (post-meeting) ────────────────────────────── */
+  .steps { display: grid; gap: .125rem; margin: 0 0 1.75rem; padding: 0; list-style: none; }
+  .steps li {
+    display: grid; grid-template-columns: 1.25rem minmax(0,1fr) auto; gap: .75rem;
+    align-items: center; padding: .5rem 0; font-size: .875rem;
+  }
+  .steps .mark { font-family: var(--mono); font-size: .75rem; color: var(--faint); }
+  .steps .done .mark { color: var(--muted); }
+  .steps .now .mark { color: var(--signal); }
+  .steps .now { color: var(--text); }
+  .steps .todo { color: var(--faint); }
+  .steps .took { font-family: var(--mono); font-size: .6875rem; color: var(--faint); font-variant-numeric: tabular-nums; }
+
+  .streams { display: grid; gap: .75rem; }
+  .stream {
+    display: grid; grid-template-columns: 4rem minmax(0,1fr) auto; gap: 1rem; align-items: center;
+    padding: .875rem; border: 1px solid var(--line); border-radius: 8px; background: var(--sunk);
+  }
+  .stream.bad { border-color: var(--alarm); }
+  .stream .who { font-family: var(--mono); font-size: .75rem; color: var(--muted); }
+  .stream .facts { font-family: var(--mono); font-size: .6875rem; color: var(--faint); display: flex; gap: .875rem; flex-wrap: wrap; font-variant-numeric: tabular-nums; }
+  /* Level is drawn, not just printed: a flat trace is the shape of a failed
+     capture, and it reads faster than a number in dBFS. */
+  .trace { height: 22px; display: flex; align-items: center; gap: 1px; }
+  .trace i { display: block; width: 2px; background: var(--signal); border-radius: 1px; }
+  .stream.bad .trace i { background: var(--alarm); opacity: .5; }
+
+  .alarm-note {
+    margin: 1rem 0 0; padding: .875rem; border-radius: 8px;
+    border: 1px solid var(--alarm); background: color-mix(in srgb, var(--alarm) 8%, transparent);
+    font-size: .8125rem; line-height: 1.6; color: var(--text); max-width: 54ch;
+  }
+  .alarm-note b { font-weight: 600; }
+  .alarm-note code { font-family: var(--mono); font-size: .9em; color: var(--muted); }
+
+  /* ── note + transcript ───────────────────────────────────────── */
+  .tabs { display: flex; gap: .25rem; margin: 0 0 1.5rem; border-bottom: 1px solid var(--line-soft); }
+  .tabs button {
+    font-family: var(--mono); font-size: .75rem; color: var(--faint);
+    background: none; border: 0; border-bottom: 1.5px solid transparent;
+    padding: .5rem .625rem; margin-bottom: -1px; cursor: pointer;
+  }
+  .tabs button:hover { color: var(--muted); }
+  .tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--signal); }
+  .tabs button:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
+  .tabpanel { display: none; }
+  .tabpanel[data-active] { display: block; }
+
+  .note-head { border-bottom: 1px solid var(--line-soft); padding-bottom: 1.125rem; margin-bottom: 1.75rem; }
+  .note-head h3 { font-family: var(--prose); font-weight: 500; font-size: 1.375rem; letter-spacing: -.01em; margin: 0 0 .4rem; text-wrap: balance; }
+  .note-meta { font-family: var(--mono); font-size: .6875rem; color: var(--faint); display: flex; flex-wrap: wrap; gap: .875rem; }
+
+  .entry {
+    display: grid; grid-template-columns: 3.5rem minmax(0,1fr); gap: .5rem 1.25rem;
+    padding-bottom: 1.5rem; margin-bottom: 1.5rem; border-bottom: 1px solid var(--line-soft);
+  }
+  .entry:last-child { border-bottom: 0; margin-bottom: 0; padding-bottom: 0; }
+  @media (max-width: 34rem) { .entry { grid-template-columns: minmax(0,1fr); } }
+  .entry time { font-family: var(--mono); font-size: .75rem; color: var(--faint); font-variant-numeric: tabular-nums; padding-top: .2rem; }
+  /* What you typed, in the face you typed it in. */
+  .said { font-family: var(--mono); font-size: .8125rem; color: var(--muted); margin: 0 0 .55rem; }
+  /* What the machine wrote. Mono → serif is the whole idea: you can always
+     see which words were yours. */
+  .grew { font-family: var(--prose); font-size: 1.0625rem; line-height: 1.62; margin: 0; max-width: 62ch; }
+  .unverified .grew {
+    font-family: var(--mono); font-size: .8125rem; color: var(--muted);
+    border-left: 2px solid var(--signal-dim); padding-left: .75rem;
+  }
+
+  .source { margin-top: .875rem; }
+  .source summary {
+    font-family: var(--mono); font-size: .6875rem; letter-spacing: .06em; color: var(--faint);
+    cursor: pointer; list-style: none; display: inline-flex; align-items: center; gap: .375rem;
+  }
+  .source summary::-webkit-details-marker { display: none; }
+  .source summary::before { content: "＋"; font-size: .75rem; line-height: 1; }
+  .source[open] summary::before { content: "－"; }
+  .source summary:hover { color: var(--muted); }
+  .source summary:focus-visible { outline: 2px solid var(--signal); outline-offset: 3px; border-radius: 2px; }
+  .source dl {
+    margin: .75rem 0 0; padding-left: .875rem; border-left: 1px solid var(--line);
+    display: grid; gap: .5rem; font-family: var(--mono); font-size: .75rem; line-height: 1.55;
+  }
+  .source dt { color: var(--faint); font-variant-numeric: tabular-nums; }
+  .source dd { margin: .125rem 0 0; color: var(--muted); max-width: 58ch; }
+  .source .you { color: var(--text); }
+
+  /* ── transcript ──────────────────────────────────────────────── */
+  .script { display: grid; gap: .25rem; }
+  .line { display: grid; grid-template-columns: 3.5rem 3rem minmax(0,1fr); gap: .875rem; padding: .3125rem 0; font-size: .875rem; line-height: 1.6; }
+  @media (max-width: 40rem) { .line { grid-template-columns: 3.5rem minmax(0,1fr); } .line .who { display: none; } }
+  .line time { font-family: var(--mono); font-size: .75rem; color: var(--faint); font-variant-numeric: tabular-nums; }
+  .line .who { font-family: var(--mono); font-size: .6875rem; color: var(--faint); letter-spacing: .04em; padding-top: .15rem; }
+  .line.me p { color: var(--text); }
+  .line.them p { color: var(--muted); }
+  .line p { margin: 0; max-width: 64ch; }
+  /* Your fragments are pinned into the transcript at the moment you typed
+     them — the two records are one timeline, not two documents. */
+  .pin {
+    grid-column: 1 / -1; display: grid; grid-template-columns: 3.5rem minmax(0,1fr); gap: .875rem;
+    margin: .5rem 0; padding: .5rem 0; border-top: 1px solid var(--signal-dim); border-bottom: 1px solid var(--signal-dim);
+  }
+  .pin time { font-family: var(--mono); font-size: .75rem; color: var(--signal); font-variant-numeric: tabular-nums; }
+  .pin span { font-family: var(--mono); font-size: .8125rem; color: var(--signal); }
+
+  /* ── settings ────────────────────────────────────────────────── */
+  .set { display: grid; gap: 1.75rem; max-width: 40rem; }
+  .set section > h3 {
+    font-family: var(--mono); font-size: .6875rem; letter-spacing: .12em; text-transform: uppercase;
+    color: var(--faint); font-weight: 400; margin: 0 0 .875rem;
+  }
+  .field { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 1rem; align-items: center; padding: .6875rem 0; border-bottom: 1px solid var(--line-soft); }
+  .field:last-child { border-bottom: 0; }
+  .field .label { font-size: .875rem; }
+  .field .sub { font-size: .75rem; color: var(--faint); margin: .1875rem 0 0; line-height: 1.5; max-width: 42ch; }
+  .value { font-family: var(--mono); font-size: .75rem; color: var(--muted); }
+  .swatch {
+    font-family: var(--mono); font-size: .75rem; color: var(--text); background: var(--sunk);
+    border: 1px solid var(--line); border-radius: 6px; padding: .3125rem .5rem;
+  }
+
+  .footnote {
+    margin-top: 3rem; padding-top: 1.75rem; border-top: 1px solid var(--line);
+    display: grid; gap: 1.5rem; grid-template-columns: repeat(auto-fit, minmax(15rem,1fr));
+  }
+  .footnote h3 {
+    font-family: var(--mono); font-size: .6875rem; letter-spacing: .12em; text-transform: uppercase;
+    color: var(--faint); margin: 0 0 .5rem; font-weight: 400;
+  }
+  .footnote p { margin: 0; font-size: .875rem; line-height: 1.6; color: var(--muted); max-width: 40ch; }
+
+  .duo { display: grid; gap: clamp(1.5rem,3vw,2.5rem); grid-template-columns: repeat(auto-fit, minmax(17rem,1fr)); align-items: start; }
+
+  @media (prefers-reduced-motion: reduce) { *, *::after { animation: none !important; transition: none !important; } }
+</style>
+
+<div class="wrap">
+  <header class="masthead">
+    <p class="eyebrow">meetnote · interface</p>
+    <h1>You type three words. The meeting fills in the rest.</h1>
+    <p>
+      A local meeting notepad for macOS. Every screen it needs, in the order you meet
+      them: start a recording, type through it, check what was captured, read the note.
+    </p>
+  </header>
+
+  <nav class="screens" id="nav">
+    <button data-go="menubar" aria-current="true">menu bar</button>
+    <button data-go="panel">during</button>
+    <button data-go="check">after</button>
+    <button data-go="library">library</button>
+    <button data-go="note">note &amp; transcript</button>
+    <button data-go="settings">settings</button>
+  </nav>
+
+  <!-- ── menu bar ───────────────────────────────────────────── -->
+  <section class="screen" id="menubar" data-active>
+    <div class="duo">
+      <div>
+        <p class="caption">Idle — nothing running</p>
+        <div class="menubar">
+          <div class="head"><p>No meeting in progress</p></div>
+          <button class="action">Start recording</button>
+          <div class="recent">
+            <p>LAST</p>
+            <a href="#">Platform sync · yesterday, 34 min</a>
+          </div>
+        </div>
+        <p class="note-under">
+          The app lives in the menu bar. Recording starts in one click; nothing
+          joins your call and no indicator appears to anyone else.
+        </p>
+      </div>
+      <div>
+        <p class="caption">Recording</p>
+        <div class="menubar">
+          <div class="head">
+            <p><span class="pill live"><span class="dot beat"></span>Recording</span></p>
+          </div>
+          <button class="action">Stop and write it up</button>
+          <div class="recent">
+            <p>CAPTURING</p>
+            <a href="#">18:32 elapsed · both streams live</a>
+          </div>
+        </div>
+        <p class="note-under">
+          “Stop and write it up” says what happens next. The button that stops
+          the meeting is the button that produces the note.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── during ─────────────────────────────────────────────── -->
+  <section class="screen" id="panel">
+    <div class="duo">
+      <div>
+        <p class="caption">The floating panel</p>
+        <div class="panel">
+          <div class="panel-bar">
+            <span class="dot beat" style="color:var(--signal)" aria-hidden="true"></span>
+            <span class="elapsed">18:32</span>
+            <div class="meters">
+              <div class="meter"><span>you</span><div class="bars" data-bars="me" aria-label="Your microphone level"></div></div>
+              <div class="meter"><span>them</span><div class="bars" data-bars="them" aria-label="Call audio level"></div></div>
+            </div>
+          </div>
+          <ul class="fragments">
+            <li><time>02:14</time><span>postgres migration 40%</span></li>
+            <li><time>04:51</time><span>webhook dupes — idempotency keys</span></li>
+            <li><time>09:03</time><span>friday v2.4 ship?</span></li>
+            <li><time>12:40</time><span>my action: fix in staging by wed</span></li>
+            <li><time>15:22</time><span>ask design re: onboarding flow</span></li>
+          </ul>
+          <div class="composer"><time>18:32</time><span class="caret"></span></div>
+        </div>
+      </div>
+      <div>
+        <p class="caption">Why it looks like this</p>
+        <p class="note-under" style="max-width:38ch">
+          You are half-listening while you type, so the panel asks for nothing.
+          No formatting, no buttons, no live transcript competing for the
+          attention it is trying to protect.
+        </p>
+        <p class="note-under" style="max-width:38ch">
+          The meters are the only colour in the app. Flat meters mean nothing is
+          being recorded — worth seeing now rather than tomorrow morning.
+        </p>
+        <p class="note-under" style="max-width:38ch">
+          Each line is stamped with the moment you typed it. That stamp is how the
+          fragment later finds the part of the conversation it was reacting to.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── after ──────────────────────────────────────────────── -->
+  <section class="screen" id="check">
+    <div class="window">
+      <div class="titlebar">
+        <div class="lights"><i></i><i></i><i></i></div>
+        <h2>Platform sync</h2>
+      </div>
+      <div class="body">
+        <div class="rail">
+          <div class="rail-group">
+            <h3>Meetings</h3>
+            <a href="#" aria-current="page"><b>Platform sync</b><span>now</span></a>
+            <a href="#"><b>Design review</b><span>Thu</span></a>
+            <a href="#"><b>1:1 — Priya</b><span>Wed</span></a>
+          </div>
+        </div>
+        <div class="pane">
+          <p class="caption">Writing up · 34 min recorded</p>
+          <ol class="steps">
+            <li class="done"><span class="mark">✓</span><span>Captured two streams</span><span class="took">34:02</span></li>
+            <li class="done"><span class="mark">✓</span><span>Transcribed</span><span class="took">2m 41s</span></li>
+            <li class="now"><span class="mark">●</span><span>Writing your note</span><span class="took">running</span></li>
+            <li class="todo"><span class="mark">○</span><span>Ready to read</span><span class="took"></span></li>
+          </ol>
+
+          <p class="caption">What was captured</p>
+          <div class="streams">
+            <div class="stream">
+              <span class="who">you</span>
+              <div class="trace" data-trace="live" aria-hidden="true"></div>
+              <div class="facts"><span>34:02</span><span>−24.6 dBFS</span></div>
+            </div>
+            <div class="stream bad">
+              <span class="who">them</span>
+              <div class="trace" data-trace="flat" aria-hidden="true"></div>
+              <div class="facts"><span>34:02</span><span>silent</span></div>
+            </div>
+          </div>
+
+          <div class="alarm-note">
+            <b>The other side wasn’t recorded.</b> Their audio ran for the full
+            34 minutes but every sample is empty, which happens when macOS hasn’t
+            granted permission to record this computer’s audio. Your own notes and
+            microphone are safe. Open <code>Privacy &amp; Security → Audio Recording</code>,
+            switch meetnote on, and the next meeting will capture both sides.
+          </div>
+        </div>
+      </div>
+    </div>
+    <p class="note-under" style="max-width:56ch">
+      This screen exists because a refused recording looks exactly like a quiet
+      one — a full-length file of silence, no error anywhere. Showing the level
+      of both streams turns an invisible failure into something you catch in the
+      first ten seconds after a meeting instead of the next morning.
+    </p>
+  </section>
+
+  <!-- ── library ────────────────────────────────────────────── -->
+  <section class="screen" id="library">
+    <div class="window">
+      <div class="titlebar">
+        <div class="lights"><i></i><i></i><i></i></div>
+        <h2>meetnote</h2>
+      </div>
+      <div class="body">
+        <div class="rail">
+          <div class="rail-group">
+            <h3>This week</h3>
+            <a href="#" aria-current="page"><b>Platform sync</b><span>34m</span></a>
+            <a href="#"><b>Design review</b><span>52m</span></a>
+            <a href="#"><b>1:1 — Priya</b><span>28m</span></a>
+          </div>
+          <div class="rail-group">
+            <h3>Earlier</h3>
+            <a href="#"><b>Vendor call</b><span>41m</span></a>
+            <a href="#"><b>Roadmap</b><span>1h 6m</span></a>
+          </div>
+        </div>
+        <div class="pane">
+          <p class="caption">All meetings · 5</p>
+          <div class="lib">
+            <div class="row" aria-current="true">
+              <span class="when">16 Aug</span>
+              <div>
+                <h4>Platform sync</h4>
+                <p class="frags">postgres migration 40% · webhook dupes · friday v2.4 ship? · fix in staging by wed</p>
+              </div>
+              <span class="len">34m</span>
+            </div>
+            <div class="row">
+              <span class="when">14 Aug</span>
+              <div>
+                <h4>Design review</h4>
+                <p class="frags">onboarding flow — 3 screens · drop the tour? · handoff friday</p>
+              </div>
+              <span class="len">52m</span>
+            </div>
+            <div class="row">
+              <span class="when">13 Aug</span>
+              <div>
+                <h4>1:1 — Priya</h4>
+                <p class="frags">wants more backend work · promo case in Q4 · unblock on staging access</p>
+              </div>
+              <span class="len">28m</span>
+            </div>
+            <div class="row">
+              <span class="when">11 Aug</span>
+              <div>
+                <h4>Vendor call</h4>
+                <p class="frags">pricing tiers · SOC2 by nov · ask legal re: DPA</p>
+              </div>
+              <span class="len">41m</span>
+            </div>
+            <div class="row">
+              <span class="when">08 Aug</span>
+              <div>
+                <h4>Roadmap</h4>
+                <p class="frags">q4 themes · migration must land first · hiring 2 backend</p>
+              </div>
+              <span class="len">1h 6m</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <p class="note-under" style="max-width:56ch">
+      Each meeting is previewed by your own fragments rather than a generated
+      summary. You find a meeting again by what you thought was worth writing
+      down — which is the only part you actually wrote.
+    </p>
+  </section>
+
+  <!-- ── note & transcript ──────────────────────────────────── -->
+  <section class="screen" id="note">
+    <div class="window">
+      <div class="titlebar">
+        <div class="lights"><i></i><i></i><i></i></div>
+        <h2>Platform sync</h2>
+      </div>
+      <div class="body">
+        <div class="rail">
+          <div class="rail-group">
+            <h3>This week</h3>
+            <a href="#" aria-current="page"><b>Platform sync</b><span>34m</span></a>
+            <a href="#"><b>Design review</b><span>52m</span></a>
+            <a href="#"><b>1:1 — Priya</b><span>28m</span></a>
+          </div>
+        </div>
+        <div class="pane">
+          <div class="tabs" role="tablist">
+            <button role="tab" aria-selected="true" data-tab="tab-note">Note</button>
+            <button role="tab" aria-selected="false" data-tab="tab-script">Transcript</button>
+          </div>
+
+          <div class="tabpanel" id="tab-note" data-active role="tabpanel">
+            <div class="note-head">
+              <h3>Platform sync — migration and the Friday release</h3>
+              <div class="note-meta">
+                <span>16 Aug 2026</span><span>34 min</span><span>5 fragments</span><span>gpt-oss:20b · local</span>
+              </div>
+            </div>
+
+            <div class="entry">
+              <time>02:14</time>
+              <div>
+                <p class="said">postgres migration 40%</p>
+                <p class="grew">
+                  The Postgres migration is about forty percent complete. The events table
+                  moved across last week, and the remaining work is expected to take three
+                  more weeks.
+                </p>
+              </div>
+            </div>
+
+            <div class="entry">
+              <time>04:51</time>
+              <div>
+                <p class="said">webhook dupes — idempotency keys</p>
+                <p class="grew">
+                  Duplicate webhook deliveries are happening because idempotency keys aren’t
+                  being set properly — roughly twelve thousand over the past week. Not large
+                  in absolute terms, but customers have started noticing.
+                </p>
+                <details class="source">
+                  <summary>What was said</summary>
+                  <dl>
+                    <dt>04:38 · you</dt>
+                    <dd class="you">The problem is the webhook retries. We’re seeing duplicate deliveries because idempotency keys aren’t being set properly.</dd>
+                    <dt>04:57 · them</dt>
+                    <dd>Thoda detail do na. How many duplicates are we talking about?</dd>
+                    <dt>05:04 · you</dt>
+                    <dd class="you">Roughly twelve thousand over the last week. Matlab it’s not huge, but customers are noticing.</dd>
+                  </dl>
+                </details>
+              </div>
+            </div>
+
+            <div class="entry">
+              <time>09:03</time>
+              <div>
+                <p class="said">friday v2.4 ship?</p>
+                <p class="grew">
+                  The idempotency fix ships before the v2.4 release on Friday. Friday is
+                  realistic for the fix itself; the full migration is unaffected and still
+                  needs its three weeks.
+                </p>
+              </div>
+            </div>
+
+            <div class="entry">
+              <time>12:40</time>
+              <div>
+                <p class="said">my action: fix in staging by wed</p>
+                <p class="grew">I own the idempotency fix and will have it in staging by Wednesday.</p>
+              </div>
+            </div>
+
+            <div class="entry unverified">
+              <time>15:22</time>
+              <div>
+                <p class="said">ask design re: onboarding flow</p>
+                <p class="grew">Not discussed in the transcript — kept as written.</p>
+              </div>
+            </div>
+          </div>
+
+          <div class="tabpanel" id="tab-script" role="tabpanel">
+            <p class="caption">Full transcript · your notes pinned where you typed them</p>
+            <div class="script">
+              <div class="line them"><time>04:12</time><span class="who">them</span><p>Okay, let’s start. Can you give us the update on the migration?</p></div>
+              <div class="line me"><time>04:20</time><span class="who">you</span><p>Haan, so the Postgres migration is about forty percent done. We moved the events table last week.</p></div>
+              <div class="line me"><time>04:38</time><span class="who">you</span><p>The problem is the webhook retries. We’re seeing duplicate deliveries because idempotency keys aren’t being set properly.</p></div>
+              <div class="pin"><time>04:51</time><span>webhook dupes — idempotency keys</span></div>
+              <div class="line them"><time>04:57</time><span class="who">them</span><p>Thoda detail do na. How many duplicates are we talking about?</p></div>
+              <div class="line me"><time>05:04</time><span class="who">you</span><p>Roughly twelve thousand over the last week. Matlab it’s not huge, but customers are noticing.</p></div>
+              <div class="line them"><time>05:19</time><span class="who">them</span><p>Theek hai. I think we should ship the idempotency fix before the version two point four release on Friday.</p></div>
+            </div>
+            <p class="note-under" style="max-width:52ch">
+              Two streams, one timeline. Your side and theirs were recorded
+              separately, so who said what is a fact about the recording rather
+              than a guess made afterwards.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── settings ───────────────────────────────────────────── -->
+  <section class="screen" id="settings">
+    <div class="window">
+      <div class="titlebar">
+        <div class="lights"><i></i><i></i><i></i></div>
+        <h2>Settings</h2>
+      </div>
+      <div class="body">
+        <div class="rail">
+          <div class="rail-group">
+            <h3>Settings</h3>
+            <a href="#" aria-current="page"><b>Recording</b></a>
+            <a href="#"><b>Writing</b></a>
+            <a href="#"><b>Storage</b></a>
+          </div>
+        </div>
+        <div class="pane">
+          <div class="set">
+            <section>
+              <h3>Permissions</h3>
+              <div class="field">
+                <div>
+                  <div class="label">Microphone</div>
+                  <p class="sub">Records your side of the meeting.</p>
+                </div>
+                <span class="pill">granted</span>
+              </div>
+              <div class="field">
+                <div>
+                  <div class="label">Audio recording</div>
+                  <p class="sub">Records everyone else. Without it, their side is captured as silence.</p>
+                </div>
+                <span class="pill warn">not granted</span>
+              </div>
+            </section>
+
+            <section>
+              <h3>Transcription</h3>
+              <div class="field">
+                <div>
+                  <div class="label">Engine</div>
+                  <p class="sub">Runs on this Mac. Nothing is uploaded.</p>
+                </div>
+                <span class="swatch">whisper large-v3-turbo</span>
+              </div>
+              <div class="field">
+                <div>
+                  <div class="label">Spoken language</div>
+                  <p class="sub">Detect keeps mixed languages as they were said. Forcing English translates instead of transcribing.</p>
+                </div>
+                <span class="swatch">detect</span>
+              </div>
+              <div class="field">
+                <div>
+                  <div class="label">Names and terms</div>
+                  <p class="sub">Words worth spelling right — teammates, products, jargon.</p>
+                </div>
+                <span class="value">14 words</span>
+              </div>
+            </section>
+
+            <section>
+              <h3>Writing the note</h3>
+              <div class="field">
+                <div>
+                  <div class="label">Model</div>
+                  <p class="sub">Local. Your transcript stays on this Mac.</p>
+                </div>
+                <span class="swatch">gpt-oss:20b · ollama</span>
+              </div>
+              <div class="field">
+                <div>
+                  <div class="label">Cloud models</div>
+                  <p class="sub">Turning one on sends your transcript off this Mac. Off by default.</p>
+                </div>
+                <span class="pill">off</span>
+              </div>
+            </section>
+          </div>
+        </div>
+      </div>
+    </div>
+    <p class="note-under" style="max-width:56ch">
+      Permissions sit at the top because they are the one setting that silently
+      ruins a recording. Everything about where your words go is stated in the
+      setting itself, not in a policy page.
+    </p>
+  </section>
+
+  <section class="footnote">
+    <div>
+      <h3>Two typefaces</h3>
+      <p>Monospace is what you typed; the serif is what the meeting wrote back. Both stay on screen so you can see which words were yours.</p>
+    </div>
+    <div>
+      <h3>Timestamps lead</h3>
+      <p>The moment you typed a fragment is how it finds the right stretch of transcript, so it earns the left margin rather than decorating it.</p>
+    </div>
+    <div>
+      <h3>Colour means live</h3>
+      <p>One amber, used only for audio that is actually being captured. At rest the app has no colour at all.</p>
+    </div>
+    <div>
+      <h3>Every claim checkable</h3>
+      <p>Open “What was said” on any point to read the transcript either side of the moment you typed. The note never asks to be taken on trust.</p>
+    </div>
+  </section>
+</div>
+
+<script>
+  const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  // Screens
+  const nav = document.getElementById("nav");
+  const screens = [...document.querySelectorAll(".screen")];
+  nav.addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-go]");
+    if (!button) return;
+    [...nav.children].forEach((b) => b.setAttribute("aria-current", String(b === button)));
+    screens.forEach((s) => s.toggleAttribute("data-active", s.id === button.dataset.go));
+  });
+
+  // Note / transcript tabs
+  document.querySelectorAll(".tabs").forEach((tabs) => {
+    tabs.addEventListener("click", (event) => {
+      const tab = event.target.closest("button[data-tab]");
+      if (!tab) return;
+      [...tabs.children].forEach((t) => t.setAttribute("aria-selected", String(t === tab)));
+      document.querySelectorAll(".tabpanel").forEach((p) =>
+        p.toggleAttribute("data-active", p.id === tab.dataset.tab),
+      );
+    });
+  });
+
+  // Live meters — two channels sampled independently: the far end runs hot,
+  // your own mic idles until you speak.
+  const build = (el, n) => {
+    for (let i = 0; i < n; i++) el.appendChild(document.createElement("i"));
+    return [...el.children];
+  };
+  const groups = [...document.querySelectorAll("[data-bars]")].map((el) => ({
+    bars: build(el, 5),
+    hot: el.dataset.bars === "them",
+  }));
+  const drive = () =>
+    groups.forEach(({ bars, hot }) =>
+      bars.forEach((bar) => {
+        const level = hot ? 30 + Math.random() * 70 : 12 + Math.random() * 26;
+        bar.style.height = `${Math.round(level)}%`;
+      }),
+    );
+  drive();
+  if (!reduced) setInterval(drive, 130);
+
+  // Capture traces. The flat one is the shape of a refused recording — the
+  // failure this project kept hitting, drawn so it reads before the number does.
+  document.querySelectorAll("[data-trace]").forEach((el) => {
+    const flat = el.dataset.trace === "flat";
+    for (let i = 0; i < 72; i++) {
+      const bar = document.createElement("i");
+      bar.style.height = flat ? "1px" : `${3 + Math.round(Math.random() ** 1.7 * 19)}px`;
+      el.appendChild(bar);
+    }
+  });
+</script>

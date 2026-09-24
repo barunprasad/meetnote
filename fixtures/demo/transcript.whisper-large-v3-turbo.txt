@@ -1,0 +1,12 @@
+[00:00:00] THEM: Okay, let's start. Priya can you give us the update on the migration?
+[00:00:04] ME: huh, so the postgaz migration is about 40% done we moved the events table last week the problem is the webhook retries we are seeing duplicate deliveries because idempotency keys are not being set properly
+[00:00:20] THEM: Thoradite, how many duplicates are we talking about?
+[00:00:25] ME: roughly 12,000 over the last week Matlab it is not huge, but customers are noticing
+[00:00:33] THEM: Okay, I think we should ship the idempotency fix before the version 2.4 release on Friday.
+[00:00:41] THEM: Can we do that in 3 weeks, or is Friday realistic?
+[00:00:47] ME: Friday is realistic for the fix, the full migration will take 3 more weeks
+[00:00:54] THEM: Okay, now let's talk about the uncall rotation. Rohan has been covering nights for a month.
+[00:01:02] THEM: Yes, we need to rebalance that. Meera can take Tuesdays and Thursdays starting next week.
+[00:01:10] THEM: And we should document the escalation path properly, it is still tribal knowledge.
+[00:01:18] ME: I will own the idempotency fix and have it in staging by Wednesday
+[00:01:25] THEM: Perfect. Let's keep the Kafka can on the wand next week.

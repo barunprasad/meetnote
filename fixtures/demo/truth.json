@@ -1,0 +1,80 @@
+[
+  {
+    "stream": "system",
+    "speaker": "Tara",
+    "start_secs": 0.5,
+    "end_secs": 4.0099583333333335
+  },
+  {
+    "stream": "mic",
+    "speaker": "Rishi",
+    "start_secs": 4.8,
+    "end_secs": 11.4799375
+  },
+  {
+    "stream": "mic",
+    "speaker": "Rishi",
+    "start_secs": 12.3,
+    "end_secs": 20.122583333333335
+  },
+  {
+    "stream": "system",
+    "speaker": "Tara",
+    "start_secs": 21.0,
+    "end_secs": 24.063291666666668
+  },
+  {
+    "stream": "mic",
+    "speaker": "Rishi",
+    "start_secs": 25.8,
+    "end_secs": 32.275416666666665
+  },
+  {
+    "stream": "system",
+    "speaker": "Aman",
+    "start_secs": 33.5,
+    "end_secs": 39.567125
+  },
+  {
+    "stream": "system",
+    "speaker": "Tara",
+    "start_secs": 42.0,
+    "end_secs": 45.2353125
+  },
+  {
+    "stream": "mic",
+    "speaker": "Rishi",
+    "start_secs": 47.8,
+    "end_secs": 52.91491666666667
+  },
+  {
+    "stream": "system",
+    "speaker": "Aman",
+    "start_secs": 55.0,
+    "end_secs": 59.898041666666664
+  },
+  {
+    "stream": "system",
+    "speaker": "Tara",
+    "start_secs": 63.0,
+    "end_secs": 68.483
+  },
+  {
+    "stream": "system",
+    "speaker": "Aman",
+    "start_secs": 71.0,
+    "end_secs": 72.8465625
+  },
+  {
+    "stream": "mic",
+    "speaker": "Rishi",
+    "start_secs": 78.8,
+    "end_secs": 82.96960416666667
+  },
+  {
+    "stream": "system",
+    "speaker": "Tara",
+    "start_secs": 86.0,
+    "end_secs": 90.73908333333334
+  }
+]

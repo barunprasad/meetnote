@@ -1,0 +1,14 @@
+[package]
+name = "meetnote-stt"
+version = "0.1.0"
+edition = "2021"
+description = "Two-stream transcription: whisper.cpp in-process, merged onto one timeline."
+
+[dependencies]
+# In-process rather than a sidecar — whisper.cpp is a C library, so Rust can
+# call it directly and we avoid a third language and an IPC protocol.
+whisper-rs = { version = "0.16", features = ["metal"] }
+meetnote-core = { path = "../core" }
+thiserror = "2"
+hound = "3"          # wav reading
+rubato = "0.15"      # 48 kHz capture -> 16 kHz whisper input

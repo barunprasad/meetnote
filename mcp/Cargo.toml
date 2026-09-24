@@ -1,0 +1,23 @@
+[package]
+name = "meetnote-mcp"
+version = "0.1.0"
+edition = "2021"
+description = "Reads meetnote's notes over MCP, so Claude Code can answer questions about your meetings."
+
+[[bin]]
+name = "meetnote-mcp"
+path = "src/main.rs"
+
+[dependencies]
+meetnote-core = { path = "../core" }
+rmcp = { version = "3", features = ["server", "transport-io", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+chrono = "0.4"
+dirs = "5"
+anyhow = "1"
+
+[dev-dependencies]
+serde_json = "1"

@@ -1,0 +1,25 @@
+{
+  "started_at": "2026-08-14T18:00:00Z",
+  "streams": [
+    {
+      "label": "mic",
+      "speaker": "ME",
+      "path": "mic.wav",
+      "sample_rate": 48000,
+      "channels": 1,
+      "frames": 5088000,
+      "duration_seconds": 106.0,
+      "offset_seconds": 0.2
+    },
+    {
+      "label": "system",
+      "speaker": "THEM",
+      "path": "system.wav",
+      "sample_rate": 48000,
+      "channels": 2,
+      "frames": 5088000,
+      "duration_seconds": 106.0,
+      "offset_seconds": 0.0
+    }
+  ]
+}

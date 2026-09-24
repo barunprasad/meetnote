@@ -1,0 +1,32 @@
+# Build output
+target/
+app/dist/
+app/src-tauri/gen/schemas/
+node_modules/
+__pycache__/
+*.pyc
+
+# Python experimentation bench
+.venv/
+
+# Built app bundles and the convenience symlink from build.sh
+meetnote-capture.app/
+*.app/
+capture
+
+# Recordings: meeting audio never belongs in the repository, and it is
+# ~350 MB an hour. The benchmark fixtures are audio too — regenerate them
+# with make_fixture.py rather than carrying 29 MB in history.
+recordings/
+*.wav
+
+# Speech models, downloaded on first run
+models/
+*.bin
+
+# macOS
+.DS_Store
+
+# The Swift sidecar binary: built from capture.swift by ./build.sh and copied
+# in at package time, so the source is what the repository carries.
+**/src-tauri/binaries/

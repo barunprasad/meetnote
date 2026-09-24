@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>meetnote TCC spike</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body {
+        font: 14px/1.5 ui-sans-serif, -apple-system, system-ui, sans-serif;
+        margin: 0; padding: 2rem; max-width: 46rem;
+      }
+      h1 { font-size: 1.1rem; margin: 0 0 .25rem; }
+      p.sub { margin: 0 0 1.5rem; opacity: .7; }
+      button {
+        font: inherit; padding: .5rem 1rem; border-radius: 6px;
+        border: 1px solid currentColor; background: transparent; cursor: pointer;
+      }
+      button:disabled { opacity: .5; cursor: default; }
+      #verdict { margin: 1.25rem 0 .5rem; font-weight: 600; }
+      #verdict.pass { color: #15803d; }
+      #verdict.fail { color: #b91c1c; }
+      pre {
+        white-space: pre-wrap; word-break: break-word; font-size: 12px;
+        background: color-mix(in srgb, currentColor 6%, transparent);
+        padding: .75rem; border-radius: 6px; margin: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Does a Swift sidecar inherit this app's audio-capture grant?</h1>
+    <p class="sub">
+      Records 5 seconds through the bundled capture binary and reports whether the
+      samples are real or digital silence. Approve any permission prompt that appears.
+    </p>
+    <button id="run">Record 5 seconds</button>
+    <div id="verdict"></div>
+    <pre id="detail"></pre>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

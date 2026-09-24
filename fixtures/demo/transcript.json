@@ -1,0 +1,102 @@
+{
+  "engine": "whisper:large-v3-turbo (mlx-community/whisper-large-v3-turbo)",
+  "language": "auto",
+  "turns": [
+    {
+      "start": 0.0,
+      "end": 4.66,
+      "speaker": "THEM",
+      "text": "Okay, let's start. Priya can you give us the update on the migration?",
+      "no_speech_prob": 8.739568313834156e-13,
+      "avg_logprob": -0.34419051806132
+    },
+    {
+      "start": 4.399999999999997,
+      "end": 20.14,
+      "speaker": "ME",
+      "text": "huh, so the postgaz migration is about 40% done we moved the events table last week the problem is the webhook retries we are seeing duplicate deliveries because idempotency keys are not being set properly",
+      "no_speech_prob": 7.375328646419543e-13,
+      "avg_logprob": -0.18352085993840145
+    },
+    {
+      "start": 20.86,
+      "end": 24.28,
+      "speaker": "THEM",
+      "text": "Thoradite, how many duplicates are we talking about?",
+      "no_speech_prob": 8.739568313834156e-13,
+      "avg_logprob": -0.34419051806132
+    },
+    {
+      "start": 25.619999999999994,
+      "end": 32.24,
+      "speaker": "ME",
+      "text": "roughly 12,000 over the last week Matlab it is not huge, but customers are noticing",
+      "no_speech_prob": 7.375328646419543e-13,
+      "avg_logprob": -0.18352085993840145
+    },
+    {
+      "start": 33.1,
+      "end": 39.34,
+      "speaker": "THEM",
+      "text": "Okay, I think we should ship the idempotency fix before the version 2.4 release on Friday.",
+      "no_speech_prob": 1.4113946990301773e-11,
+      "avg_logprob": -0.28973222914196195
+    },
+    {
+      "start": 41.52,
+      "end": 45.02,
+      "speaker": "THEM",
+      "text": "Can we do that in 3 weeks, or is Friday realistic?",
+      "no_speech_prob": 1.4113946990301773e-11,
+      "avg_logprob": -0.28973222914196195
+    },
+    {
+      "start": 47.660000000000004,
+      "end": 52.980000000000004,
+      "speaker": "ME",
+      "text": "Friday is realistic for the fix, the full migration will take 3 more weeks",
+      "no_speech_prob": 8.389848603178318e-13,
+      "avg_logprob": -0.26574451692642703
+    },
+    {
+      "start": 54.6,
+      "end": 60.26,
+      "speaker": "THEM",
+      "text": "Okay, now let's talk about the uncall rotation. Rohan has been covering nights for a month.",
+      "no_speech_prob": 1.8358001750706787e-12,
+      "avg_logprob": -0.17780189514160155
+    },
+    {
+      "start": 62.62,
+      "end": 68.34,
+      "speaker": "THEM",
+      "text": "Yes, we need to rebalance that. Meera can take Tuesdays and Thursdays starting next week.",
+      "no_speech_prob": 1.8358001750706787e-12,
+      "avg_logprob": -0.17780189514160155
+    },
+    {
+      "start": 70.56,
+      "end": 75.34,
+      "speaker": "THEM",
+      "text": "And we should document the escalation path properly, it is still tribal knowledge.",
+      "no_speech_prob": 2.777298790251903e-12,
+      "avg_logprob": -0.2997044154575893
+    },
+    {
+      "start": 78.48,
+      "end": 82.92,
+      "speaker": "ME",
+      "text": "I will own the idempotency fix and have it in staging by Wednesday",
+      "no_speech_prob": 1.6229009238907799e-12,
+      "avg_logprob": -0.1815498377147474
+    },
+    {
+      "start": 85.68,
+      "end": 89.16,
+      "speaker": "THEM",
+      "text": "Perfect. Let's keep the Kafka can on the wand next week.",
+      "no_speech_prob": 2.777298790251903e-12,
+      "avg_logprob": -0.2997044154575893
+    }
+  ]
+}

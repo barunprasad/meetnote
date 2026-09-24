@@ -1,0 +1,15 @@
+[package]
+name = "meetnote-diarize"
+version = "0.1.0"
+edition = "2021"
+description = "Splits the far-end stream into individual speakers, behind a swappable trait."
+
+[dependencies]
+meetnote-core = { path = "../core" }
+thiserror = "2"
+speakrs = { version = "0.5", features = ["coreml"] }
+
+[dev-dependencies]
+hound = "3"
+serde_json = "1"
+speakrs = { version = "0.5", features = ["coreml"] }

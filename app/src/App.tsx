@@ -350,8 +350,61 @@ function CaptureCheck({ streams }: { streams: Stream[] }) {
   );
 }
 
+/**
+ * A speaker's name, renamed in place. The calendar names the far end only when
+ * there is exactly one person it can be; everything else is left for you, and
+ * a name given here applies to every line that speaker said in this meeting.
+ */
+function SpeakerName({ turn, onRename }: { turn: Turn; onRename: (speaker: string, name: string) => void }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+
+  if (!editing) {
+    return (
+      <button
+        className="turn-who turn-who-button"
+        title="Rename this speaker"
+        aria-label={`${who(turn)}, rename this speaker`}
+        onClick={() => {
+          setDraft(turn.speaker_name ?? "");
+          setEditing(true);
+        }}
+      >
+        {who(turn)}
+      </button>
+    );
+  }
+
+  const save = () => {
+    setEditing(false);
+    const name = draft.trim();
+    if (name !== (turn.speaker_name ?? "")) onRename(turn.speaker, name);
+  };
+  return (
+    <input
+      className="turn-who turn-who-input"
+      value={draft}
+      autoFocus
+      placeholder={who(turn)}
+      aria-label={`Name for ${who(turn)}`}
+      onChange={(event) => setDraft(event.target.value)}
+      onBlur={save}
+      onKeyDown={(event) => {
+        if (event.key === "Enter") event.currentTarget.blur();
+        if (event.key === "Escape") setEditing(false);
+      }}
+    />
+  );
+}
+
 /** The transcript, grouped so a run of lines from one person reads as one block. */
-function Transcript({ turns }: { turns: Turn[] | null }) {
+function Transcript({
+  turns,
+  onRename,
+}: {
+  turns: Turn[] | null;
+  onRename: (speaker: string, name: string) => void;
+}) {
   if (turns === null) return <p className="quiet">Loading the transcript…</p>;
   if (turns.length === 0)
     return (
@@ -373,7 +426,7 @@ function Transcript({ turns }: { turns: Turn[] | null }) {
       {blocks.map((block, i) => (
         <div className={`turn${block[0].speaker === "ME" ? " you" : ""}`} key={i}>
           <p className="turn-head">
-            <span className="turn-who">{who(block[0])}</span>
+            <SpeakerName turn={block[0]} onRename={onRename} />
             <time aria-label={spokenClock(block[0].start_secs)}>{clock(block[0].start_secs)}</time>
           </p>
           <p className="turn-said">{block.map((t) => t.text).join(" ")}</p>
@@ -497,6 +550,21 @@ function MeetingView({
   const length = meeting.ended_at ? meeting.ended_at - meeting.started_at : 0;
   const working = meeting.status === "transcribing" || meeting.status === "enhancing";
 
+  const renameSpeaker = async (speaker: string, name: string) => {
+    await invoke("rename_speaker", { meetingId: meeting.id, speaker, name });
+    setTurns(await invoke<Turn[]>("turns", { meetingId: meeting.id, from: 0, to: Number.MAX_VALUE }));
+    announce(name ? `Speaker renamed to ${name}` : "Speaker name cleared");
+  };
+
+  const transcribeAgain = async () => {
+    try {
+      await invoke("retranscribe", { meetingId: meeting.id });
+      announce("Transcribing again");
+    } catch (error) {
+      announce(String(error));
+    }
+  };
+
   return (
     <article className="page">
       <header>
@@ -510,6 +578,9 @@ function MeetingView({
           <Menu
             label="Meeting actions"
             items={[
+              ...(streams.length > 0 && !working && meeting.status !== "recording"
+                ? [{ label: "Transcribe again", onSelect: transcribeAgain }]
+                : []),
               ...(streams.length > 0
                 ? [{ label: "Delete recording, keep note", onSelect: onDeleteRecordings }]
                 : []),
@@ -564,7 +635,7 @@ function MeetingView({
               )}
             </>
           ))}
-        {tab === "transcript" && <Transcript turns={turns} />}
+        {tab === "transcript" && <Transcript turns={turns} onRename={renameSpeaker} />}
       </div>
     </article>
   );

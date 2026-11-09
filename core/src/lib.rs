@@ -9,6 +9,9 @@ use std::path::Path;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
+pub mod people;
+pub use people::Participant;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
@@ -87,6 +90,37 @@ impl Stream {
     pub fn is_silent(&self) -> bool {
         self.peak_dbfs.is_some_and(|db| db < -80.0)
     }
+
+    /// The rate this stream was really recorded at, when the header is wrong.
+    ///
+    /// `reference_secs` is how long the stream actually ran by some independent
+    /// clock — the host-time span the sidecar measured, or for older recordings
+    /// the meeting's own start and end. A header that disagrees with it by more
+    /// than 10% is lying: a Bluetooth headset in call mode delivered 24 kHz into
+    /// a file declared 48 kHz, and the far end of a 40-minute interview came out
+    /// as 20 minutes at double speed, which Whisper transcribed as one invented
+    /// sentence repeated ninety times. The meeting still went green.
+    ///
+    /// Only rates audio devices actually run at are accepted — Bluetooth call
+    /// modes (8, 16, 24 kHz) and the two media rates — and only within 3%, so a
+    /// stream that is short for some other reason (it dropped out) is left
+    /// alone rather than "corrected" into nonsense.
+    pub fn true_rate(&self, reference_secs: f64) -> Option<i64> {
+        const DEVICE_RATES: [i64; 5] = [8_000, 16_000, 24_000, 44_100, 48_000];
+        let duration = self.duration_secs?;
+        if self.sample_rate <= 0 || duration <= 0.0 || reference_secs < 10.0 {
+            return None;
+        }
+        if ((duration - reference_secs) / reference_secs).abs() <= 0.10 {
+            return None;
+        }
+        let frames = duration * self.sample_rate as f64;
+        let measured = frames / reference_secs;
+        DEVICE_RATES
+            .into_iter()
+            .filter(|rate| *rate != self.sample_rate)
+            .find(|rate| ((measured - *rate as f64) / *rate as f64).abs() <= 0.03)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +149,7 @@ impl Store {
         let conn = Connection::open(path)?;
         Store::configure(&conn)?;
         conn.execute_batch(include_str!("schema.sql"))?;
+        Store::migrate(&conn)?;
         Ok(Store { conn })
     }
 
@@ -137,7 +172,24 @@ impl Store {
         let conn = Connection::open_in_memory()?;
         Store::configure(&conn)?;
         conn.execute_batch(include_str!("schema.sql"))?;
+        Store::migrate(&conn)?;
         Ok(Store { conn })
+    }
+
+    /// Columns added after the first release. `CREATE TABLE IF NOT EXISTS`
+    /// leaves an existing table alone, so these are added by hand. They are read
+    /// only through their own methods, never by `query_meetings`, so the
+    /// read-only MCP server keeps working against a database the app has not
+    /// opened since upgrading.
+    fn migrate(conn: &Connection) -> Result<()> {
+        let has = |column: &str| -> Result<bool> {
+            let mut stmt = conn.prepare("SELECT 1 FROM pragma_table_info('meeting') WHERE name = ?1")?;
+            Ok(stmt.exists([column])?)
+        };
+        if !has("participants")? {
+            conn.execute_batch("ALTER TABLE meeting ADD COLUMN participants TEXT")?;
+        }
+        Ok(())
     }
 
     fn configure(conn: &Connection) -> Result<()> {
@@ -188,10 +240,35 @@ impl Store {
     /// calendar says who was invited.
     pub fn name_speaker(&self, meeting_id: &str, speaker: &str, name: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE turn SET speaker_name = ?3 WHERE meeting_id = ?1 AND speaker = ?2",
+            // An empty name clears it, back to "Them" / "Speaker 2".
+            "UPDATE turn SET speaker_name = NULLIF(?3, '') WHERE meeting_id = ?1 AND speaker = ?2",
             params![meeting_id, speaker, name],
         )?;
         Ok(())
+    }
+
+    /// Who the calendar said was invited, kept with the meeting rather than in
+    /// app memory: naming speakers happens after transcription, which may be
+    /// after a restart, or weeks later when a meeting is transcribed again.
+    pub fn set_participants(&self, meeting_id: &str, participants: &[Participant]) -> Result<()> {
+        self.conn.execute(
+            "UPDATE meeting SET participants = ?2 WHERE id = ?1",
+            params![meeting_id, serde_json::to_string(participants)?],
+        )?;
+        Ok(())
+    }
+
+    /// `None` when the calendar was never asked, as opposed to asked and empty.
+    pub fn participants(&self, meeting_id: &str) -> Result<Option<Vec<Participant>>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row("SELECT participants FROM meeting WHERE id = ?1", [meeting_id], |r| r.get(0))
+            .optional()?
+            .flatten();
+        Ok(match raw {
+            Some(json) => Some(serde_json::from_str(&json)?),
+            None => None,
+        })
     }
 
     pub fn set_status(&self, meeting_id: &str, status: Status) -> Result<()> {
@@ -245,6 +322,13 @@ impl Store {
     /// killed mid-meeting. Their audio is on disk and can still be transcribed.
     pub fn recover_interrupted(&self) -> Result<Vec<Meeting>> {
         self.query_meetings("WHERE status = 'recording'", [])
+    }
+
+    /// Meetings whose processing was cut off: the app quit while transcribing
+    /// or writing the note. Nothing resumes those on its own, so without this
+    /// they sit at "Transcribing" forever.
+    pub fn unfinished(&self) -> Result<Vec<Meeting>> {
+        self.query_meetings("WHERE status IN ('transcribing', 'enhancing')", [])
     }
 
     // ── notes typed during the meeting ─────────────────────────────────────
@@ -533,6 +617,58 @@ mod tests {
         assert!(!mic.is_silent());
         // The offset is what the merge depends on — it must survive the round trip.
         assert!((system.offset_secs - 0.003).abs() < f64::EPSILON);
+    }
+
+    fn stream(rate: i64, duration: f64) -> Stream {
+        Stream {
+            label: "system".into(), path: "system.wav".into(), sample_rate: rate,
+            channels: 2, offset_secs: 2.47, duration_secs: Some(duration), peak_dbfs: Some(-1.0),
+        }
+    }
+
+    #[test]
+    fn a_header_that_halves_the_meeting_is_corrected() {
+        // The real failure: 24 kHz audio in a file declared 48 kHz, so 2386 s
+        // of meeting read as 1193 s. The meeting's own clock gives it away.
+        assert_eq!(stream(48_000, 1193.08).true_rate(2391.5), Some(24_000));
+        // And the other way round: 48 kHz delivered into a 24 kHz header.
+        assert_eq!(stream(24_000, 4776.0).true_rate(2388.0), Some(48_000));
+    }
+
+    #[test]
+    fn honest_or_merely_short_streams_are_left_alone() {
+        // Startup latency is not a rate error.
+        assert_eq!(stream(48_000, 2386.2).true_rate(2394.0), None);
+        // A stream that dropped out for a third of the meeting is short, not
+        // fast — no standard rate explains it, so nothing is "fixed".
+        assert_eq!(stream(48_000, 1600.0).true_rate(2394.0), None);
+        // Too short to judge.
+        assert_eq!(stream(48_000, 2.0).true_rate(5.0), None);
+    }
+
+    #[test]
+    fn participants_survive_and_unasked_differs_from_empty() {
+        let store = Store::open_memory().unwrap();
+        let id = meeting(&store);
+        assert_eq!(store.participants(&id).unwrap(), None, "never asked");
+        let asha = Participant {
+            name: Some("Asha Verma".into()), email: Some("asha@example.com".into()),
+            is_me: false, kind: "person".into(), declined: false,
+        };
+        store.set_participants(&id, &[asha.clone()]).unwrap();
+        assert_eq!(store.participants(&id).unwrap(), Some(vec![asha]));
+        store.set_participants(&id, &[]).unwrap();
+        assert_eq!(store.participants(&id).unwrap(), Some(vec![]), "asked, nobody listed");
+    }
+
+    #[test]
+    fn processing_cut_off_by_a_quit_is_found_at_launch() {
+        let store = Store::open_memory().unwrap();
+        let id = meeting(&store);
+        store.finish_recording(&id, 1_700_000_600).unwrap();
+        assert_eq!(store.unfinished().unwrap().len(), 1);
+        store.set_status(&id, Status::Done).unwrap();
+        assert!(store.unfinished().unwrap().is_empty());
     }
 
     #[test]

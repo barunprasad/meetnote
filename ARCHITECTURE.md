@@ -126,6 +126,16 @@ Port from `capture.swift` unchanged, including three fixes that must survive:
   on a Bluetooth headset makes macOS recreate the output device; building the
   aggregate first binds it to a device that is about to vanish.
 - **Record each stream's first-buffer host time.** The entire merge rests on it.
+- **Write the system stream at the aggregate device's rate, not the tap's.**
+  On a Bluetooth headset in call mode `kAudioTapPropertyFormat` still reports
+  48 kHz while the aggregate delivers 24 kHz. Trusting the tap produced a
+  40-minute interview whose far end was 20 minutes at double speed; Whisper
+  transcribed it as one invented sentence repeated ninety times, and the
+  meeting went green. The sidecar now reads the aggregate's nominal rate,
+  resamples if it changes mid-call, and reports each stream's host-clock span
+  as `wall_seconds`. The app compares that against the header and stores the
+  true rate (`Stream::true_rate`), which also repairs recordings made before
+  the fix — for those it checks against the meeting's own start and end.
 
 ### Transcription and diarisation — in-process, not sidecars
 
@@ -144,6 +154,15 @@ way:
 - **Transcribe faithfully; normalise in the LLM.** Devanagari in the transcript
   is correct. The enhancement step renders the note in the user's language with
   the whole transcript as context, which beats a decoder working 30 s at a time.
+- **Decode in chunks of at most 28 s, never a whole stream at once.** One
+  `full()` over forty minutes lets an invented line push whisper's seek past
+  real speech: two minutes of a candidate's answer became a single made-up
+  sentence. Chunks come from the same −50 dBFS floor (wide on purpose — it
+  decides what is decoded, not what counts as speech), so each stream's long
+  silences while the other side talks never reach the decoder either.
+- **Collapse decoder loops.** Consecutive identical sentences become one, and a
+  line repeated verbatim within a minute on the same stream is dropped. People
+  rephrase; decoders reproduce.
 - **Energy filtering only catches invention over near-silence.** It must never
   try to separate speech from background. Audio bleeding from speakers raises the
   measured noise floor above the speaker's own voice; an earlier version did
@@ -163,6 +182,7 @@ audio at `recordings/<uuid>/`. WAL mode, so the MCP reader never blocks a write.
 ```sql
 CREATE TABLE meeting (
     id          TEXT PRIMARY KEY,
+    participants TEXT,                       -- calendar invitees, json; added by migration
     started_at  INTEGER NOT NULL,
     ended_at    INTEGER,
     title       TEXT,
@@ -342,7 +362,34 @@ ahc_threshold   speakers   accuracy
 
 Two things that matters for: the usable window is one step wide, and the fixture
 is TTS — far more consistent than real accented speech over a compressed call.
-**Re-run the sweep on real audio before trusting 0.8.** It takes five seconds.
+
+**Re-run on real audio (29 Oct, one remote speaker, 40 min, Indian English over
+a call codec)** with `MEETNOTE_ONE_VOICE_WAV=… cargo test --release --test
+benchmark -- --ignored one_real`:
+
+```text
+ahc_threshold   speakers   largest holds
+  0.60             3          91.0%
+  0.80             2          92.8%
+  1.00             2          92.8%
+```
+
+No threshold finds one person: a 7–9% sliver always splits off. So diarisation
+alone cannot be trusted to count heads. Two rules compensate, in `name_far_end`
+and `meetnote_core::people`:
+
+- A cluster holding under 15% of the far end's *words* does not count as a
+  voice. Words, not seconds: in the app's own run, clusters of pure backchannel
+  ("yeah", "mm-hmm") held 3% of the words but 15% of the turn time, because
+  whisper stretches a short reply across the pause around it.
+- **One invitee besides you means every far-end turn is theirs**, whatever the
+  clusters say. With several invitees, a name is applied only when one voice
+  was heard and exactly one invitee is named in the title (the interview
+  shape). Invitees come from EventKit with `isCurrentUser`, room/resource type
+  and declined status, and address-only guests are kept — dropping nameless
+  attendees once made an external candidate invisible. Participants are
+  stored on the meeting, so naming works after a restart or a re-transcribe,
+  and anything else can be named by clicking the speaker in the transcript.
 
 Diarisation is best-effort by design: if it fails, the meeting still gets a
 transcript with an undifferentiated `THEM`, because a labelled transcript is

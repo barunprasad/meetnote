@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 
-use meetnote_core::{Meeting, NoteFragment, Status, Store, Stream, Turn};
+use meetnote_core::{Meeting, NoteFragment, Participant, Status, Store, Stream, Turn};
 use serde::{Deserialize, Serialize};
 use tauri::{
     menu::{Menu, MenuItem},
@@ -30,10 +30,30 @@ struct Recording {
 struct App {
     store: Mutex<Option<Store>>,
     recording: Mutex<Option<Recording>>,
-    /// Held from the start of the meeting so speakers can be named once
-    /// diarisation has produced them.
-    attendees: Mutex<Vec<String>>,
+    /// Held for the whole of a transcription. Whisper and the diarisation
+    /// models each want most of the machine, so a second job (a recovered
+    /// meeting at launch, a "transcribe again") waits its turn rather than
+    /// running alongside.
+    transcribing: Mutex<()>,
+    call: Mutex<CallState>,
 }
+
+/// What the call watcher last reported, kept here so a panel opened later can
+/// ask rather than wait for the next event.
+#[derive(Default)]
+struct CallState {
+    current: Option<CallEvent>,
+    /// "Not now" for this call: stay quiet until it ends.
+    dismissed: bool,
+    /// Set when the call ends mid-recording. The recording stops at this
+    /// moment unless you choose to keep it going or the call comes back.
+    stop_at: Option<std::time::Instant>,
+}
+
+/// How long a recording outlives its call. Long enough to rejoin after a
+/// dropped connection; short enough that a forgotten recording doesn't keep
+/// running into the next hour.
+const STOP_AFTER_CALL: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn now() -> i64 {
     chrono::Utc::now().timestamp()
@@ -98,6 +118,10 @@ struct SidecarStream {
     /// Absent from sidecars built before the level was reported.
     #[serde(default)]
     peak_dbfs: Option<f64>,
+    /// Host-clock span of the stream — the independent check on the header's
+    /// rate. Absent from older sidecars.
+    #[serde(default)]
+    wall_seconds: Option<f64>,
 }
 
 // ── recording ──────────────────────────────────────────────────────────────
@@ -158,13 +182,15 @@ fn start_recording(app: AppHandle, state: State<App>) -> Result<StartedRecording
 
     // Named at the start rather than the end: the calendar event is happening
     // now, and by the time the meeting stops it may already be over.
-    if let Some(event) = calendar_now() {
+    if let Some(event) = calendar_event(None, true) {
         let _ = with_store(&state, |store| {
             store
                 .set_title(&meeting_id, &event.title, Some("calendar"))
+                .map_err(|e| e.to_string())?;
+            store
+                .set_participants(&meeting_id, &event.participants())
                 .map_err(|e| e.to_string())
         });
-        *state.attendees.lock().map_err(|e| e.to_string())? = event.attendees;
     }
 
     *state.recording.lock().map_err(|e| e.to_string())? = Some(Recording {
@@ -172,7 +198,7 @@ fn start_recording(app: AppHandle, state: State<App>) -> Result<StartedRecording
         child,
         started_at,
     });
-    show_panel(&app);
+    show_panel(&app, PanelMode::Notes);
     refresh_tray(&app, true);
     let _ = app.emit("recording:started", &meeting_id);
     Ok(StartedRecording { meeting_id })
@@ -196,6 +222,9 @@ struct StoredStream {
 fn stop_recording(app: AppHandle, state: State<App>) -> Result<Captured, String> {
     hide_panel(&app);
     refresh_tray(&app, false);
+    if let Ok(mut call) = state.call.lock() {
+        call.stop_at = None;
+    }
     let _ = app.emit("recording:stopped", ());
     let mut recording = state
         .recording
@@ -216,6 +245,20 @@ fn stop_recording(app: AppHandle, state: State<App>) -> Result<Captured, String>
     let audio_dir = data_dir()
         .join("recordings")
         .join(recording.started_at.to_string());
+    let stored = with_store(&state, |store| ingest_capture(store, &meeting_id, &audio_dir, now()))?;
+
+    transcribe_in_background(app, meeting_id.clone(), false);
+    Ok(Captured { meeting_id, streams: stored })
+}
+
+/// Records what the sidecar captured and marks the meeting ready to transcribe.
+/// Shared by a normal stop and by recovery after a crash.
+fn ingest_capture(
+    store: &mut Store,
+    meeting_id: &str,
+    audio_dir: &std::path::Path,
+    ended_at: i64,
+) -> Result<Vec<StoredStream>, String> {
     let meta = std::fs::read_to_string(audio_dir.join("capture.json"))
         .map_err(|e| format!("capture produced no metadata: {e}"))?;
     let parsed: serde_json::Value = serde_json::from_str(&meta).map_err(|e| e.to_string())?;
@@ -223,42 +266,50 @@ fn stop_recording(app: AppHandle, state: State<App>) -> Result<Captured, String>
         serde_json::from_value(parsed["streams"].clone()).map_err(|e| e.to_string())?;
 
     let mut stored = Vec::new();
-    with_store(&state, |store| {
-        for s in &streams {
-            // The sidecar measures the loudest sample; keep it as a level so the
-            // capture check can show what was heard rather than a boolean. Older
-            // sidecars reported only `silent`, so fall back to the floor for
-            // those — but never leave a healthy stream without a level, which
-            // used to make every stream look silent and skip transcription.
-            let peak = s.peak_dbfs.or(if s.silent { Some(-120.0) } else { None });
-            store
-                .put_stream(
-                    &meeting_id,
-                    &Stream {
-                        label: s.label.clone(),
-                        path: s.path.clone(),
-                        sample_rate: s.sample_rate,
-                        channels: s.channels,
-                        offset_secs: s.offset_seconds,
-                        duration_secs: Some(s.duration_seconds),
-                        peak_dbfs: peak,
-                    },
-                )
-                .map_err(|e| e.to_string())?;
-            stored.push(StoredStream {
-                label: s.label.clone(),
-                duration_secs: s.duration_seconds,
-                peak_dbfs: peak,
-                silent: s.silent,
-            });
+    for s in &streams {
+        // The sidecar measures the loudest sample; keep it as a level so the
+        // capture check can show what was heard rather than a boolean. Older
+        // sidecars reported only `silent`, so fall back to the floor for
+        // those — but never leave a healthy stream without a level, which
+        // used to make every stream look silent and skip transcription.
+        let peak = s.peak_dbfs.or(if s.silent { Some(-120.0) } else { None });
+        let mut stream = Stream {
+            label: s.label.clone(),
+            path: s.path.clone(),
+            sample_rate: s.sample_rate,
+            channels: s.channels,
+            offset_secs: s.offset_seconds,
+            duration_secs: Some(s.duration_seconds),
+            peak_dbfs: peak,
+        };
+        if let Some(wall) = s.wall_seconds {
+            correct_rate(&mut stream, wall);
         }
-        store
-            .finish_recording(&meeting_id, now())
-            .map_err(|e| e.to_string())
-    })?;
+        store.put_stream(meeting_id, &stream).map_err(|e| e.to_string())?;
+        stored.push(StoredStream {
+            label: stream.label,
+            duration_secs: stream.duration_secs.unwrap_or_default(),
+            peak_dbfs: peak,
+            silent: s.silent,
+        });
+    }
+    store.finish_recording(meeting_id, ended_at).map_err(|e| e.to_string())?;
+    Ok(stored)
+}
 
-    transcribe_in_background(app, meeting_id.clone());
-    Ok(Captured { meeting_id, streams: stored })
+/// Fixes a stream whose header claims the wrong rate, judged against how long
+/// it really ran. Returns whether anything changed. The wav itself is left as
+/// recorded; the stored rate is what transcription reads it at.
+fn correct_rate(stream: &mut Stream, reference_secs: f64) -> bool {
+    let Some(rate) = stream.true_rate(reference_secs) else { return false };
+    eprintln!(
+        "{} stream: header says {} Hz but it ran {:.0}s — reading it at {} Hz",
+        stream.label, stream.sample_rate, reference_secs, rate
+    );
+    let frames = stream.duration_secs.unwrap_or_default() * stream.sample_rate as f64;
+    stream.sample_rate = rate;
+    stream.duration_secs = Some(frames / rate as f64);
+    true
 }
 
 #[tauri::command]
@@ -315,6 +366,52 @@ fn fragments(state: State<App>, meeting_id: String) -> Result<Vec<NoteFragment>,
     with_store(&state, |store| {
         store.fragments(&meeting_id).map_err(|e| e.to_string())
     })
+}
+
+/// Names a speaker in one meeting — for when the calendar could not say who
+/// they were, or said wrongly.
+#[tauri::command]
+fn rename_speaker(
+    app: AppHandle,
+    state: State<App>,
+    meeting_id: String,
+    speaker: String,
+    name: String,
+) -> Result<(), String> {
+    let name = name.trim();
+    with_store(&state, |store| {
+        store.name_speaker(&meeting_id, &speaker, name).map_err(|e| e.to_string())
+    })?;
+    let _ = app.emit("meeting:updated", meeting_id);
+    Ok(())
+}
+
+/// Runs transcription again from the audio on disk, replacing the transcript.
+/// For meetings processed by an older, buggier pipeline, and for any that
+/// failed. Notes typed during the meeting are untouched.
+#[tauri::command]
+fn retranscribe(app: AppHandle, state: State<App>, meeting_id: String) -> Result<(), String> {
+    let meeting = with_store(&state, |store| {
+        let meeting = store
+            .meeting(&meeting_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("no such meeting")?;
+        if matches!(meeting.status, Status::Recording | Status::Transcribing | Status::Enhancing) {
+            return Err("this meeting is still being processed".into());
+        }
+        if meeting.audio_dir.is_empty() {
+            return Err("the recordings for this meeting were deleted".into());
+        }
+        Ok(meeting)
+    })?;
+    with_store(&state, |store| {
+        store.set_status(&meeting.id, Status::Transcribing).map_err(|e| e.to_string())
+    })?;
+    let _ = app.emit("meeting:updated", meeting_id.clone());
+    // You just asked for this, so the calendar may ask too — it is the one
+    // moment a permission prompt has someone to answer it.
+    transcribe_in_background(app, meeting_id, true);
+    Ok(())
 }
 
 // ── reads ──────────────────────────────────────────────────────────────────
@@ -568,21 +665,39 @@ fn download_model(app: AppHandle) {
 
 /// Runs after capture. Whisper on the ANE is cheap enough to run immediately,
 /// unlike the enhancement pass, which wants the machine to itself.
-fn transcribe_in_background(app: AppHandle, meeting_id: String) {
+///
+/// `may_ask` lets the calendar lookup show its permission prompt; true only when
+/// the user started this.
+fn transcribe_in_background(app: AppHandle, meeting_id: String, may_ask: bool) {
     std::thread::spawn(move || {
         let state = app.state::<App>();
         let model = model_path();
         if !model.exists() {
             return; // nothing to do until the model is downloaded
         }
+        let Ok(_turn) = state.transcribing.lock() else { return };
 
         let prepared = with_store(&state, |store| {
-            let streams = store.streams(&meeting_id).map_err(|e| e.to_string())?;
-            let audio_dir = store
+            let meeting = store
                 .meeting(&meeting_id)
                 .map_err(|e| e.to_string())?
-                .map(|m| m.audio_dir)
                 .ok_or("meeting vanished")?;
+            let mut streams = store.streams(&meeting_id).map_err(|e| e.to_string())?;
+
+            // Recordings made before the sidecar measured its own clock carry
+            // no check on their header, so check them against the meeting's:
+            // a stream that ran the whole meeting but claims half of it was
+            // read at the wrong rate. Corrected in the store, so this happens
+            // once and the capture check shows the real length.
+            if let Some(ended_at) = meeting.ended_at {
+                let span = (ended_at - meeting.started_at) as f64;
+                for stream in &mut streams {
+                    if correct_rate(stream, span - stream.offset_secs) {
+                        store.put_stream(&meeting_id, stream).map_err(|e| e.to_string())?;
+                    }
+                }
+            }
+
             // The words you type are the names Whisper otherwise mangles, so
             // they are fed back as decoding hints. The tool gets better at your
             // vocabulary the more you use it, with nothing to configure.
@@ -605,9 +720,27 @@ fn transcribe_in_background(app: AppHandle, meeting_id: String) {
                     vocab.push(term);
                 }
             }
-            Ok((streams, audio_dir, vocab))
+            Ok((meeting, streams, vocab))
         });
-        let Ok((streams, audio_dir, vocab)) = prepared else { return };
+        let Ok((meeting, streams, vocab)) = prepared else { return };
+
+        // Who was invited. Asked at record start; for meetings recorded before
+        // that was kept, the calendar is asked about the time the meeting
+        // began — silently unless the user asked for this run.
+        let participants = backfill_participants(&state, &meeting, may_ask).unwrap_or_default();
+
+        // A meeting's names are its strongest vocabulary: whisper hears "Asha"
+        // far more reliably when told to expect it.
+        let title = meeting.title.clone().unwrap_or_default();
+        let mut vocab = vocab;
+        let names: Vec<String> = participants
+            .iter()
+            .filter(|p| !p.is_me)
+            .filter_map(|p| p.display_name(&title))
+            .collect();
+        for name in names.into_iter().rev() {
+            vocab.insert(0, name);
+        }
 
         // whisper's initial prompt is capped at 224 tokens and silently drops
         // the rest, so this meeting's own words go in first and older ones
@@ -628,31 +761,35 @@ fn transcribe_in_background(app: AppHandle, meeting_id: String) {
             Some(format!("This meeting mentions: {}.", kept.join(", ")))
         };
 
-        let paths: Vec<(PathBuf, String, f64)> = streams
+        let paths: Vec<(PathBuf, String, f64, u32)> = streams
             .iter()
             .filter(|s| !s.is_silent())
             .map(|s| {
                 (
-                    PathBuf::from(&audio_dir).join(&s.path),
+                    PathBuf::from(&meeting.audio_dir).join(&s.path),
                     if s.label == "mic" { "ME".to_string() } else { "THEM".to_string() },
                     s.offset_secs,
+                    // The stored rate, not the header's: they differ exactly
+                    // when the header was wrong.
+                    s.sample_rate as u32,
                 )
             })
             .collect();
         let inputs: Vec<meetnote_stt::Stream> = paths
             .iter()
-            .map(|(path, speaker, offset)| meetnote_stt::Stream {
+            .map(|(path, speaker, offset, rate)| meetnote_stt::Stream {
                 path,
                 speaker,
                 offset_secs: *offset,
+                sample_rate: Some(*rate),
             })
             .collect();
 
         let system_audio = paths
             .iter()
-            .find(|(_, speaker, _)| speaker == "THEM")
-            .and_then(|(path, _, offset)| {
-                meetnote_stt::load_16k_mono(path).ok().map(|audio| (audio, *offset))
+            .find(|(_, speaker, _, _)| speaker == "THEM")
+            .and_then(|(path, _, offset, rate)| {
+                meetnote_stt::load_16k_mono(path, Some(*rate)).ok().map(|audio| (audio, *offset))
             });
 
         let outcome = meetnote_stt::transcribe(
@@ -677,10 +814,10 @@ fn transcribe_in_background(app: AppHandle, meeting_id: String) {
                     Err(error) => eprintln!("diarisation skipped: {error}"),
                 }
             }
+            name_far_end(&mut turns, &participants, &title);
             turns
         });
 
-        let attendees = state.attendees.lock().map(|a| a.clone()).unwrap_or_default();
         let transcribed = with_store(&state, |store| {
             match outcome {
                 // Nothing transcribed is a failure, not a finished meeting.
@@ -698,7 +835,6 @@ fn transcribe_in_background(app: AppHandle, meeting_id: String) {
                 }
                 Ok(turns) => {
                     store.put_turns(&meeting_id, &turns).map_err(|e| e.to_string())?;
-                    name_speakers_from_calendar(store, &meeting_id, &attendees);
                     store.set_status(&meeting_id, Status::Enhancing).map_err(|e| e.to_string())?;
                     Ok(true)
                 }
@@ -711,9 +847,46 @@ fn transcribe_in_background(app: AppHandle, meeting_id: String) {
         let _ = app.emit("meeting:updated", meeting_id.clone());
 
         if transcribed == Ok(true) {
-            write_note(app, meeting_id);
+            write_note(app.clone(), meeting_id);
         }
     });
+}
+
+/// Puts names on the far end once diarisation has had its say.
+///
+/// When the calendar leaves only one person it can be, every far-end turn is
+/// theirs — diarisation regularly splits a single remote voice into two or
+/// three "speakers", and that is precisely what the calendar corrects. When
+/// diarisation heard one voice and nobody can be named, it is "Them" rather
+/// than "Speaker 1": a number implies there are others.
+fn name_far_end(turns: &mut [Turn], participants: &[Participant], title: &str) {
+    // Voices that hold a real share of what the far end said. On the 29 Oct
+    // interview — one remote person — clustering split off a second and third
+    // "speaker" made of nothing but "yeah", "mm-hmm" and "oh": 3% of the words.
+    // Measured in words, not seconds: whisper stretches a backchannel over the
+    // whole pause around it, and by time that same cluster looked like 15%.
+    let mut held: std::collections::BTreeMap<&str, usize> = Default::default();
+    for turn in turns.iter().filter(|t| t.speaker != "ME") {
+        *held.entry(turn.speaker.as_str()).or_default() += turn.text.split_whitespace().count();
+    }
+    let total: usize = held.values().sum();
+    let voices = held
+        .iter()
+        .filter(|(label, words)| **label != "THEM" && total > 0 && **words as f64 / total as f64 >= 0.15)
+        .count()
+        .max(1);
+    let name = meetnote_core::people::the_other_person(participants, title, voices);
+
+    for turn in turns.iter_mut().filter(|t| t.speaker != "ME") {
+        match &name {
+            Some(name) => {
+                turn.speaker = "THEM-1".into();
+                turn.speaker_name = Some(name.clone());
+            }
+            None if voices == 1 => turn.speaker = "THEM".into(),
+            None => {}
+        }
+    }
 }
 
 /// Labels the far-end speakers, shifting spans onto the meeting timeline so
@@ -782,35 +955,83 @@ fn default_model() -> String {
 struct CalendarEvent {
     #[serde(default)]
     title: String,
+    /// Names only, from sidecars that predate `participants`.
     #[serde(default)]
     attendees: Vec<String>,
     #[serde(default)]
-    in_progress: bool,
+    participants: Option<Vec<Participant>>,
 }
 
-/// Asks the sidecar what meeting is happening now. Entirely optional: no
-/// calendar grant means an untitled meeting, never a failed one.
-fn calendar_now() -> Option<CalendarEvent> {
-    let output = Command::new(sidecar().ok()?)
-        .arg("--calendar")
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    let line = String::from_utf8_lossy(&output.stdout);
+impl CalendarEvent {
+    fn participants(&self) -> Vec<Participant> {
+        self.participants.clone().unwrap_or_else(|| {
+            self.attendees
+                .iter()
+                .map(|name| Participant {
+                    name: Some(name.clone()),
+                    email: None,
+                    is_me: false,
+                    kind: "unknown".into(),
+                    declined: false,
+                })
+                .collect()
+        })
+    }
+}
+
+/// Asks the sidecar what meeting is happening now, or was happening at `at`
+/// (unix seconds). Entirely optional: no calendar grant means an untitled
+/// meeting, never a failed one.
+///
+/// `may_ask` is whether the permission prompt may appear — only when the user
+/// has just done something (started a recording, asked for a re-transcribe).
+/// Either way the answer is bounded: a lookup that never returns must not hold
+/// up the meeting it was only meant to decorate.
+fn calendar_event(at: Option<i64>, may_ask: bool) -> Option<CalendarEvent> {
+    let mut command = Command::new(sidecar().ok()?);
+    command.arg("--calendar");
+    if let Some(at) = at {
+        command.args(["--at", &at.to_string()]);
+    }
+    if !may_ask {
+        command.arg("--no-ask");
+    }
+    let mut child = command.stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    let limit = std::time::Duration::from_secs(if may_ask { 60 } else { 10 });
+    let started = std::time::Instant::now();
+    while child.try_wait().ok()?.is_none() {
+        if started.elapsed() > limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let mut line = String::new();
+    std::io::Read::read_to_string(&mut child.stdout.take()?, &mut line).ok()?;
     let event: CalendarEvent = serde_json::from_str(line.trim()).ok()?;
     (!event.title.is_empty()).then_some(event)
 }
 
-/// Attendee names become the far-end speakers. The count is what makes this
-/// safe to apply automatically: with exactly one other invitee there is only
-/// one person `THEM-1` can be, so the mapping is certain rather than a guess.
-/// Beyond that the names are recorded on the meeting and left for the user.
-fn name_speakers_from_calendar(store: &Store, meeting_id: &str, attendees: &[String]) {
-    let others: Vec<&String> = attendees.iter().collect();
-    if others.len() == 1 {
-        let _ = store.name_speaker(meeting_id, "THEM-1", others[0]);
-        let _ = store.name_speaker(meeting_id, "THEM", others[0]);
+/// Fills in who was invited for a meeting recorded before that was stored.
+/// Only for meetings the calendar already named, so an ad-hoc call never
+/// borrows the invitees of whatever happened to be scheduled.
+///
+/// The lookup runs outside the store lock and off the main thread: it can sit
+/// behind a permission prompt for up to a minute.
+fn backfill_participants(state: &App, meeting: &Meeting, may_ask: bool) -> Option<Vec<Participant>> {
+    let known = with_store(state, |store| store.participants(&meeting.id).map_err(|e| e.to_string()));
+    if let Ok(Some(known)) = known {
+        return Some(known);
     }
+    if meeting.source.as_deref() != Some("calendar") {
+        return None;
+    }
+    let found = calendar_event(Some(meeting.started_at), may_ask)?.participants();
+    let _ = with_store(state, |store| {
+        store.set_participants(&meeting.id, &found).map_err(|e| e.to_string())
+    });
+    Some(found)
 }
 
 #[tauri::command]
@@ -898,19 +1119,139 @@ fn watch_for_calls(app: AppHandle) {
             if event.get("type").and_then(|t| t.as_str()) != Some("call") {
                 continue;
             }
-            let _ = app.emit(
-                "call:changed",
-                CallEvent {
-                    state: event["state"].as_str().unwrap_or("ended").to_string(),
-                    name: event["name"].as_str().unwrap_or("a call").to_string(),
-                    app: event["app"].as_str().unwrap_or_default().to_string(),
-                },
-            );
+            let call = CallEvent {
+                state: event["state"].as_str().unwrap_or("ended").to_string(),
+                name: event["name"].as_str().unwrap_or("a call").to_string(),
+                app: event["app"].as_str().unwrap_or_default().to_string(),
+            };
+            let _ = app.emit("call:changed", &call);
+            if call.state == "started" {
+                call_started(&app, call);
+            } else {
+                call_ended(&app);
+            }
         }
     });
 }
 
+fn is_live(app: &AppHandle) -> bool {
+    app.state::<App>().recording.lock().map(|r| r.is_some()).unwrap_or(false)
+}
+
+/// Offers to record where you will see it: the banner in the main window is
+/// invisible while you are looking at the call, which is exactly when it fires.
+fn call_started(app: &AppHandle, call: CallEvent) {
+    let state = app.state::<App>();
+    let fresh = {
+        let Ok(mut current) = state.call.lock() else { return };
+        // A call is several audio processes; the watcher reports each handover,
+        // and only the first one is news.
+        let fresh = current.current.is_none();
+        current.current = Some(call.clone());
+        current.stop_at = None;
+        if fresh {
+            current.dismissed = false;
+        }
+        fresh
+    };
+    if !fresh || is_live(app) {
+        return;
+    }
+    show_panel(app, PanelMode::Prompt);
+    // The panel can sit behind a full-screen call on another Space; the
+    // notification can't.
+    use tauri_plugin_notification::NotificationExt;
+    let _ = app
+        .notification()
+        .builder()
+        .title(format!("{} call started", call.name))
+        .body("Record it from the meetnote panel.")
+        .show();
+}
+
+fn call_ended(app: &AppHandle) {
+    let state = app.state::<App>();
+    if let Ok(mut current) = state.call.lock() {
+        current.current = None;
+        current.dismissed = false;
+    }
+    if !is_live(app) {
+        hide_panel(app);
+        return;
+    }
+    let Some(meeting_id) = state.recording.lock().ok().and_then(|r| r.as_ref().map(|r| r.meeting_id.clone()))
+    else {
+        return;
+    };
+    let deadline = std::time::Instant::now() + STOP_AFTER_CALL;
+    if let Ok(mut current) = state.call.lock() {
+        current.stop_at = Some(deadline);
+    }
+    let _ = app.emit("call:stopping", STOP_AFTER_CALL.as_secs());
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(STOP_AFTER_CALL);
+        let state = app.state::<App>();
+        // Anything since — a rejoin, "keep recording", a manual stop, a new
+        // call ending later — has replaced or cleared this deadline.
+        let due = state.call.lock().map(|c| c.stop_at == Some(deadline)).unwrap_or(false);
+        let same = state
+            .recording
+            .lock()
+            .map(|r| r.as_ref().is_some_and(|r| r.meeting_id == meeting_id))
+            .unwrap_or(false);
+        if due && same {
+            let _ = stop_recording(app.clone(), state);
+        }
+    });
+}
+
+#[derive(Serialize)]
+struct CallPrompt {
+    name: String,
+    /// Seconds until a recording whose call has ended stops by itself.
+    stops_in: Option<u64>,
+}
+
+/// What the panel should offer right now: a call to record, or a recording
+/// about to stop because its call ended.
+#[tauri::command]
+fn current_call(state: State<App>) -> Result<Option<CallPrompt>, String> {
+    let call = state.call.lock().map_err(|e| e.to_string())?;
+    let stops_in = call
+        .stop_at
+        .map(|at| at.saturating_duration_since(std::time::Instant::now()).as_secs());
+    Ok(match (&call.current, stops_in) {
+        (Some(c), _) if !call.dismissed => Some(CallPrompt { name: c.name.clone(), stops_in: None }),
+        (_, Some(secs)) => Some(CallPrompt { name: String::new(), stops_in: Some(secs) }),
+        _ => None,
+    })
+}
+
+#[tauri::command]
+fn dismiss_call(app: AppHandle, state: State<App>) -> Result<(), String> {
+    state.call.lock().map_err(|e| e.to_string())?.dismissed = true;
+    if !is_live(&app) {
+        hide_panel(&app);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn keep_recording(state: State<App>) -> Result<(), String> {
+    state.call.lock().map_err(|e| e.to_string())?.stop_at = None;
+    Ok(())
+}
+
 // ── the floating panel ─────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq)]
+enum PanelMode {
+    /// Just the question, small enough not to cover a face.
+    Prompt,
+    /// The meters and the note log, while recording.
+    Notes,
+}
 
 /// A small always-on-top window that sits over the call while you type.
 ///
@@ -918,26 +1259,126 @@ fn watch_for_calls(app: AppHandle) {
 /// tabbing away from the person talking. This is deliberately undecorated,
 /// narrow, and created unfocused so appearing does not steal the keyboard from
 /// the call — you click into it when you want it.
-fn show_panel(app: &AppHandle) {
+fn show_panel(app: &AppHandle, mode: PanelMode) {
+    let (width, height) = match mode {
+        PanelMode::Prompt => (340.0, 124.0),
+        PanelMode::Notes => (360.0, 460.0),
+    };
     if let Some(existing) = app.get_webview_window("panel") {
+        let _ = existing.set_size(tauri::LogicalSize::new(width, height));
         let _ = existing.show();
-        let _ = existing.set_focus();
+        if mode == PanelMode::Notes {
+            let _ = existing.set_focus();
+        }
         return;
     }
-    let _ = WebviewWindowBuilder::new(app, "panel", WebviewUrl::App("index.html#panel".into()))
+    // Top-right, clear of where video calls put faces.
+    let (x, y) = app
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .map(|m| (m.size().to_logical::<f64>(m.scale_factor()).width - width - 24.0, 48.0))
+        .unwrap_or((48.0, 48.0));
+    let built = WebviewWindowBuilder::new(app, "panel", WebviewUrl::App("index.html#panel".into()))
         .title("meetnote")
-        .inner_size(360.0, 460.0)
-        .min_inner_size(300.0, 260.0)
+        .inner_size(width, height)
+        .min_inner_size(300.0, 110.0)
+        .position(x, y)
         .always_on_top(true)
         .decorations(false)
         .resizable(true)
         .focused(false)
         .skip_taskbar(true)
         .build();
+    if let Ok(panel) = built {
+        float_over_every_desktop(&panel);
+    }
+}
+
+/// Otherwise the panel opens on whichever desktop meetnote's main window is
+/// on, and never over a full-screen call, which is its own desktop. Only a
+/// non-activating panel may sit there, so the window becomes one: the same
+/// move anarlog and other call overlays make.
+#[cfg(target_os = "macos")]
+fn float_over_every_desktop(panel: &tauri::WebviewWindow) {
+    use objc2::runtime::AnyObject;
+    use objc2::ClassType;
+    use objc2_app_kit::{NSPanel, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask};
+
+    let target = panel.clone();
+    let _ = panel.run_on_main_thread(move || {
+        let Ok(pointer) = target.ns_window() else { return };
+        // SAFETY: Tauri hands out the live NSWindow it owns, AppKit is only
+        // touched here on the main thread, and the new class is an NSWindow
+        // subclass that adds no storage.
+        let window = unsafe { &*(pointer as *const NSWindow) };
+        let original = unsafe { AnyObject::set_class(window.as_ref(), FloatingPanel::class()) };
+        let _ = TAO_WINDOW_CLASS.set(original);
+        let panel = unsafe { &*(pointer as *const NSPanel) };
+        panel.setStyleMask(panel.styleMask() | NSWindowStyleMask::NonactivatingPanel);
+        panel.setFloatingPanel(true);
+        panel.setHidesOnDeactivate(false);
+        panel.setCollectionBehavior(
+            panel.collectionBehavior()
+                | NSWindowCollectionBehavior::CanJoinAllSpaces
+                | NSWindowCollectionBehavior::FullScreenAuxiliary,
+        );
+        // Placed before it could join every desktop, so place it again.
+        panel.orderFrontRegardless();
+    });
+}
+
+/// The class Tauri created the panel with. Its cleanup code expects that class,
+/// and crashes the app if it finds the panel's instead, so it goes back on
+/// before the window is destroyed.
+#[cfg(target_os = "macos")]
+static TAO_WINDOW_CLASS: std::sync::OnceLock<&'static objc2::runtime::AnyClass> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "macos")]
+fn unfloat(panel: &tauri::WebviewWindow) {
+    let Some(&original) = TAO_WINDOW_CLASS.get() else { return };
+    let restore = move |target: &tauri::WebviewWindow| {
+        let Ok(pointer) = target.ns_window() else { return };
+        // SAFETY: as in `float_over_every_desktop`, in reverse.
+        let window = unsafe { &*(pointer as *const objc2::runtime::AnyObject) };
+        unsafe { objc2::runtime::AnyObject::set_class(window, original) };
+    };
+    // On quit this is already the main thread, and a queued job would never
+    // run. Otherwise it is queued ahead of the close that follows it.
+    if objc2::MainThreadMarker::new().is_some() {
+        restore(panel);
+    } else {
+        let target = panel.clone();
+        let _ = panel.run_on_main_thread(move || restore(&target));
+    }
+}
+
+#[cfg(target_os = "macos")]
+objc2::define_class!(
+    // A borderless panel refuses the keyboard unless it says otherwise, and
+    // the notes field needs it.
+    #[unsafe(super(objc2_app_kit::NSPanel, objc2_app_kit::NSWindow, objc2_app_kit::NSResponder, objc2::runtime::NSObject))]
+    #[thread_kind = objc2::MainThreadOnly]
+    #[name = "MeetnoteFloatingPanel"]
+    struct FloatingPanel;
+
+    impl FloatingPanel {
+        #[unsafe(method(canBecomeKeyWindow))]
+        fn can_become_key_window(&self) -> bool {
+            true
+        }
+    }
+);
+
+#[cfg(not(target_os = "macos"))]
+fn float_over_every_desktop(panel: &tauri::WebviewWindow) {
+    let _ = panel.set_visible_on_all_workspaces(true);
 }
 
 fn hide_panel(app: &AppHandle) {
     if let Some(panel) = app.get_webview_window("panel") {
+        #[cfg(target_os = "macos")]
+        unfloat(&panel);
         let _ = panel.close();
     }
 }
@@ -990,7 +1431,10 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
                     let _ = window.set_focus();
                 }
             }
-            "quit" => app.exit(0),
+            "quit" => {
+                hide_panel(app);
+                app.exit(0);
+            }
             _ => {}
         })
         .build(app)?;
@@ -1003,6 +1447,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(App::default())
         .setup(|app| {
             let dir = data_dir();
@@ -1012,13 +1457,37 @@ pub fn run() {
             build_tray(app.handle())?;
             watch_for_calls(app.handle().clone());
 
-            // Anything still marked `recording` means the app died mid-meeting.
-            // The audio is on disk, so re-queue it rather than stranding it.
+            // Anything still marked `recording` means the app died mid-meeting;
+            // anything transcribing or enhancing means it quit mid-processing.
+            // The audio is on disk either way. These used to be marked
+            // "transcribing" and then never actually transcribed.
+            let mut store = store;
             for stranded in store.recover_interrupted()? {
-                store.set_status(&stranded.id, Status::Transcribing)?;
+                let dir = PathBuf::from(&stranded.audio_dir);
+                let ended = std::fs::metadata(dir.join("capture.json"))
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64);
+                match ended {
+                    Some(ended_at) => {
+                        if let Err(error) = ingest_capture(&mut store, &stranded.id, &dir, ended_at) {
+                            store.fail(&stranded.id, &error)?;
+                        }
+                    }
+                    // The sidecar died before writing its metadata, so the wav
+                    // headers were never finalised either.
+                    None => store.fail(&stranded.id, "the app stopped before the recording was saved")?,
+                }
             }
+            // Ingesting marks a recovered meeting `transcribing`, so this picks
+            // those up along with any whose processing was cut off.
+            let resume = store.unfinished()?;
 
             *app.state::<App>().store.lock().unwrap() = Some(store);
+            for meeting in resume {
+                transcribe_in_background(app.handle().clone(), meeting.id, false);
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1040,9 +1509,20 @@ pub fn run() {
             delete_recordings,
             close_panel,
             live_recording,
+            current_call,
+            dismiss_call,
+            keep_recording,
             permissions,
             system_info,
+            rename_speaker,
+            retranscribe,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running meetnote");
+        .build(tauri::generate_context!())
+        .expect("error while building meetnote")
+        .run(|app, event| {
+            // Quitting from the app menu or the dock destroys the panel too.
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                hide_panel(app);
+            }
+        });
 }

@@ -141,3 +141,47 @@ fn speakrs_separates_the_two_far_end_speakers() {
         result.accuracy * 100.0
     );
 }
+
+/// The same sweep on a real call, with no labels: a recording whose far end is
+/// known to be one person. Point `MEETNOTE_ONE_VOICE_WAV` at its system stream
+/// (16 kHz mono) — real recordings are private and never committed.
+///
+///     MEETNOTE_ONE_VOICE_WAV=/path/to/system_16k.wav \
+///         cargo test --release --test benchmark -- --ignored --nocapture one_real
+///
+/// Reports how many speakers each threshold invents and how much of the speech
+/// the largest one holds. It asserts nothing: it exists to answer "is 0.8 right
+/// on real accented speech over a compressed call?", which the TTS fixture
+/// cannot.
+#[test]
+#[ignore = "needs a private recording"]
+fn one_real_far_end_voice() {
+    let Ok(path) = std::env::var("MEETNOTE_ONE_VOICE_WAV") else {
+        println!("set MEETNOTE_ONE_VOICE_WAV to run this");
+        return;
+    };
+    let audio = load_16k_mono(Path::new(&path));
+    println!("\n  ahc_threshold    speakers   largest holds");
+    for threshold in [0.6, 0.7, 0.8, 0.9, 1.0] {
+        let backend = Speakrs::tuned(PipelineConfig {
+            ahc: AhcConfig { threshold: threshold as f32 },
+            merge_gap: 0.5,
+            speaker_keep_threshold: 0.02,
+            ..PipelineConfig::default()
+        })
+        .expect("could not load models");
+        let spans = backend.diarize(&audio).expect("diarisation failed");
+        let mut by_speaker: std::collections::BTreeMap<&str, f64> = Default::default();
+        for span in &spans {
+            *by_speaker.entry(span.speaker.as_str()).or_default() += span.end_secs - span.start_secs;
+        }
+        let total: f64 = by_speaker.values().sum();
+        let largest = by_speaker.values().cloned().fold(0.0, f64::max);
+        println!(
+            "  {:<16.5} {:<10} {:.1}%",
+            threshold,
+            by_speaker.len(),
+            if total > 0.0 { largest / total * 100.0 } else { 0.0 }
+        );
+    }
+}

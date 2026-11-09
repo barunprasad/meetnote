@@ -78,6 +78,13 @@ func inputChannelCount(_ deviceID: AudioObjectID) -> Int {
     return list.reduce(0) { $0 + Int($1.mNumberChannels) }
 }
 
+/// The rate a device is running at, or 0 when it cannot be read.
+func nominalRate(_ deviceID: AudioObjectID) -> Double {
+    var rate: Float64 = 0
+    try? readProperty(deviceID, kAudioDevicePropertyNominalSampleRate, into: &rate, context: "nominal sample rate")
+    return rate
+}
+
 func readObjectList(_ objectID: AudioObjectID, _ selector: AudioObjectPropertySelector) -> [AudioObjectID] {
     var address = propertyAddress(selector)
     var size: UInt32 = 0
@@ -133,10 +140,14 @@ struct AudioProcess {
     }
 }
 
-func processName(for pid: pid_t) -> String? {
+func processPath(for pid: pid_t) -> String? {
     var buffer = [CChar](repeating: 0, count: 4096)
     guard proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0 else { return nil }
-    return URL(fileURLWithPath: String(cString: buffer)).lastPathComponent
+    return String(cString: buffer)
+}
+
+func processName(for pid: pid_t) -> String? {
+    processPath(for: pid).map { URL(fileURLWithPath: $0).lastPathComponent }
 }
 
 func listAudioProcesses() -> [AudioProcess] {
@@ -184,6 +195,12 @@ final class StreamRecorder: @unchecked Sendable {
     private var file: AVAudioFile?
     private let lock = NSLock()
     private(set) var firstHostSeconds: Double?
+    /// Host time at the end of the latest buffer. Against `firstHostSeconds` this
+    /// is how long the stream really ran, which is the only independent check on
+    /// the sample rate in the header: a device that delivers 24 kHz into a file
+    /// declared 48 kHz yields a wav that claims half the meeting and plays at
+    /// double speed — and Whisper transcribes that as fluent invention.
+    private var lastHostSeconds: Double?
     private(set) var frameCount: Int64 = 0
     private var peak: Float = 0
     /// Never reset — a denied tap still delivers frames, just full of zeros, so
@@ -212,8 +229,10 @@ final class StreamRecorder: @unchecked Sendable {
     func write(_ buffer: AVAudioPCMBuffer, hostTime: UInt64) {
         lock.lock()
         defer { lock.unlock() }
-        if firstHostSeconds == nil, hostTime != 0 {
-            firstHostSeconds = hostTimeToSeconds(hostTime)
+        if hostTime != 0 {
+            let start = hostTimeToSeconds(hostTime)
+            if firstHostSeconds == nil { firstHostSeconds = start }
+            lastHostSeconds = start + Double(buffer.frameLength) / buffer.format.sampleRate
         }
         guard let file else { return }
         do {
@@ -248,6 +267,15 @@ final class StreamRecorder: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return Double(frameCount) / format.sampleRate
+    }
+
+    /// Seconds of host clock the stream spanned, first buffer to last. Nil when
+    /// no buffer carried a host time.
+    var wallSeconds: Double? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let first = firstHostSeconds, let last = lastHostSeconds else { return nil }
+        return last - first
     }
 
     var captured: Bool {
@@ -300,8 +328,19 @@ final class SystemAudioTap: @unchecked Sendable {
     private var aggregateID = AudioObjectID(kAudioObjectUnknown)
     private var ioProcID: AudioDeviceIOProcID?
     private let queue = DispatchQueue(label: "meetnote.systemtap", qos: .userInitiated)
+    /// What the file is written in. Fixed for the life of the recording — a wav
+    /// has one sample rate in its header, so a mid-meeting change of device rate
+    /// is converted to this rather than appended at the wrong speed.
     let format: AVAudioFormat
     private let recorder: StreamRecorder
+    /// What the aggregate is delivering right now. The tap's own format is NOT
+    /// this: on a Bluetooth headset in call mode the tap still reports 48 kHz
+    /// while the aggregate runs at the headset's 24 kHz, and trusting the tap
+    /// produced a 40-minute interview whose far end played at double speed.
+    private var sourceFormat: AVAudioFormat
+    private var converter: AVAudioConverter?
+    private var rateListener: AudioObjectPropertyListenerBlock?
+    private var rateChanges = 0
     private var running = false
     private let outputDeviceUID: String
     private let outputDeviceName: String
@@ -341,7 +380,6 @@ final class SystemAudioTap: @unchecked Sendable {
         guard let tapFormat = AVAudioFormat(streamDescription: &asbd) else {
             throw CAError(status: -1, context: "tap format unrepresentable")
         }
-        format = tapFormat
 
         // The tap only produces audio when it is a member of an aggregate device
         // that is running. Private aggregate = invisible in Audio MIDI Setup.
@@ -377,11 +415,74 @@ final class SystemAudioTap: @unchecked Sendable {
             throw CAError(status: aggStatus, context: "AudioHardwareCreateAggregateDevice")
         }
 
+        // The buffers arrive at the aggregate's rate, whatever the tap claims.
+        // Same layout as the tap — only the rate is taken from the device.
+        let deliveredFormat = SystemAudioTap.format(tapFormat, atRate: nominalRate(aggregateID))
+        if deliveredFormat.sampleRate != tapFormat.sampleRate {
+            note("  system : tap reports \(Int(tapFormat.sampleRate)) Hz but the device runs at "
+                 + "\(Int(deliveredFormat.sampleRate)) Hz — recording at the device rate")
+        }
+        format = deliveredFormat
+        sourceFormat = deliveredFormat
+
         recorder = try StreamRecorder(
-            label: "system", url: outputDirectory.appendingPathComponent("system.wav"), format: tapFormat)
+            label: "system", url: outputDirectory.appendingPathComponent("system.wav"), format: deliveredFormat)
+    }
+
+    /// `base`'s layout at another rate. A rate of zero (unreadable) keeps `base`.
+    private static func format(_ base: AVAudioFormat, atRate rate: Double) -> AVAudioFormat {
+        guard rate > 0, rate != base.sampleRate,
+              let changed = AVAudioFormat(commonFormat: base.commonFormat, sampleRate: rate,
+                                          channels: base.channelCount, interleaved: base.isInterleaved)
+        else { return base }
+        return changed
     }
 
     var stream: StreamRecorder { recorder }
+
+    /// How many times the device changed rate mid-recording.
+    var sampleRateChanges: Int {
+        counterLock.lock()
+        defer { counterLock.unlock() }
+        return rateChanges
+    }
+
+    /// The device changed rate under us — typically a Bluetooth headset moving
+    /// between music and call mode when an app opens or closes the microphone.
+    /// Runs on `queue`, the same serial queue as the IOProc, so the swap never
+    /// races a buffer.
+    private func deviceRateChanged() {
+        let next = SystemAudioTap.format(format, atRate: nominalRate(aggregateID))
+        guard next.sampleRate != sourceFormat.sampleRate else { return }
+        note("  system : device rate changed \(Int(sourceFormat.sampleRate)) → \(Int(next.sampleRate)) Hz, "
+             + "converting to \(Int(format.sampleRate)) Hz")
+        sourceFormat = next
+        converter = next.sampleRate == format.sampleRate ? nil : AVAudioConverter(from: next, to: format)
+        counterLock.lock()
+        rateChanges += 1
+        counterLock.unlock()
+    }
+
+    /// `buffer` in the file's format: passed through when the rates agree,
+    /// resampled when the device has moved to another rate.
+    private func toFileFormat(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        guard let converter else { return buffer }
+        let ratio = format.sampleRate / buffer.format.sampleRate
+        let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 32
+        guard let output = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: capacity) else { return nil }
+        var consumed = false
+        var error: NSError?
+        let status = converter.convert(to: output, error: &error) { _, inputStatus in
+            if consumed {
+                inputStatus.pointee = .noDataNow
+                return nil
+            }
+            consumed = true
+            inputStatus.pointee = .haveData
+            return buffer
+        }
+        return status == .error ? nil : output
+    }
 
     var diagnostics: String {
         counterLock.lock()
@@ -389,12 +490,11 @@ final class SystemAudioTap: @unchecked Sendable {
         let layout = firstLayout ?? "never fired"
         return "output device \"\(outputDeviceName)\", aggregate input channels "
             + "\(inputChannelCount(aggregateID)), \(callbackCount) IOProc callbacks, "
-            + "\(bufferFailures) dropped buffers, first layout: \(layout)"
+            + "\(bufferFailures) dropped buffers, \(rateChanges) rate changes, first layout: \(layout)"
     }
 
     func start() throws {
         let recorder = self.recorder
-        let format = self.format
         let status = AudioDeviceCreateIOProcIDWithBlock(&ioProcID, aggregateID, queue) {
             [weak self] _, inInputData, inInputTime, _, _ in
             guard let self else { return }
@@ -407,12 +507,13 @@ final class SystemAudioTap: @unchecked Sendable {
             }
             self.counterLock.unlock()
 
-            if let buffer = AVAudioPCMBuffer(pcmFormat: format, bufferListNoCopy: inInputData, deallocator: nil) {
-                recorder.write(buffer, hostTime: inInputTime.pointee.mHostTime)
-            } else if let copied = Self.copyBuffer(list, format: format) {
+            let source = self.sourceFormat
+            let incoming = AVAudioPCMBuffer(pcmFormat: source, bufferListNoCopy: inInputData, deallocator: nil)
                 // The tap format and the aggregate's actual layout disagreed.
                 // Copy by hand rather than dropping the audio on the floor.
-                recorder.write(copied, hostTime: inInputTime.pointee.mHostTime)
+                ?? Self.copyBuffer(list, format: source)
+            if let incoming, let buffer = self.toFileFormat(incoming) {
+                recorder.write(buffer, hostTime: inInputTime.pointee.mHostTime)
             } else {
                 self.counterLock.lock()
                 self.bufferFailures += 1
@@ -425,6 +526,15 @@ final class SystemAudioTap: @unchecked Sendable {
         let startStatus = AudioDeviceStart(aggregateID, ioProcID)
         guard startStatus == noErr else { throw CAError(status: startStatus, context: "AudioDeviceStart") }
         running = true
+
+        let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in self?.deviceRateChanged() }
+        var address = propertyAddress(kAudioDevicePropertyNominalSampleRate)
+        if AudioObjectAddPropertyListenerBlock(aggregateID, &address, queue, listener) == noErr {
+            rateListener = listener
+        }
+        // The rate can settle between building the aggregate and starting it —
+        // a headset finishing its switch into call mode — so look once more.
+        queue.async { [weak self] in self?.deviceRateChanged() }
 
         // -1 means the property was unreadable, which happens even on a working
         // aggregate; only a definite zero indicates the tap made no input stream.
@@ -464,6 +574,11 @@ final class SystemAudioTap: @unchecked Sendable {
     }
 
     func stop() {
+        if let rateListener {
+            var address = propertyAddress(kAudioDevicePropertyNominalSampleRate)
+            AudioObjectRemovePropertyListenerBlock(aggregateID, &address, queue, rateListener)
+            self.rateListener = nil
+        }
         if running, let ioProcID {
             AudioDeviceStop(aggregateID, ioProcID)
             AudioDeviceDestroyIOProcID(aggregateID, ioProcID)
@@ -582,16 +697,21 @@ func reportPermissions() -> Never {
 /// diarised far-end speakers real identities instead of THEM-1 and THEM-2.
 ///
 /// Read-only, and entirely optional: no grant means no title, not a failure.
-func currentCalendarEvent() -> Never {
+func currentCalendarEvent(at now: Date = Date(), mayAsk: Bool = true) -> Never {
     let store = EKEventStore()
-    let semaphore = DispatchSemaphore(value: 0)
-    var granted = false
+    var granted = EKEventStore.authorizationStatus(for: .event) == .fullAccess
 
-    store.requestFullAccessToEvents { allowed, _ in
-        granted = allowed
-        semaphore.signal()
+    // Asking puts up a dialog and blocks until it is answered, so it is only
+    // done when someone is there to answer it. A background lookup that asked
+    // once held a meeting at "Transcribing" behind a prompt nobody had seen.
+    if !granted && mayAsk {
+        let semaphore = DispatchSemaphore(value: 0)
+        store.requestFullAccessToEvents { allowed, _ in
+            granted = allowed
+            semaphore.signal()
+        }
+        semaphore.wait()
     }
-    semaphore.wait()
 
     guard granted else {
         emit(["type": "calendar", "granted": false])
@@ -599,7 +719,6 @@ func currentCalendarEvent() -> Never {
     }
 
     // A meeting you join a few minutes early or late is still that meeting.
-    let now = Date()
     let window = store.predicateForEvents(
         withStart: now.addingTimeInterval(-30 * 60),
         end: now.addingTimeInterval(15 * 60),
@@ -621,16 +740,36 @@ func currentCalendarEvent() -> Never {
         exit(0)
     }
 
-    // The organiser and the user themselves are not far-end speakers to name,
-    // but sorting that out needs context this process does not have — so report
-    // everyone and let the caller decide.
-    let attendees = (event.attendees ?? []).compactMap { $0.name }
+    // Everyone, with what the caller needs to decide who could be a voice on the
+    // far end: whether it is the user, a room, or someone who declined. Names
+    // are optional on purpose — an external guest is often only an address,
+    // and dropping those made a one-on-one look like nobody else was invited.
+    let participants: [[String: Any]] = (event.attendees ?? []).map { attendee in
+        let address = attendee.url.absoluteString
+        let email = address.lowercased().hasPrefix("mailto:") ? String(address.dropFirst(7)) : nil
+        let kind: String
+        switch attendee.participantType {
+        case .person: kind = "person"
+        case .room: kind = "room"
+        case .resource: kind = "resource"
+        case .group: kind = "group"
+        default: kind = "unknown"
+        }
+        return [
+            "name": attendee.name ?? NSNull(),
+            "email": email ?? NSNull(),
+            "is_me": attendee.isCurrentUser,
+            "kind": kind,
+            "declined": attendee.participantStatus == .declined,
+        ]
+    }
 
     emit([
         "type": "calendar",
         "granted": true,
         "title": event.title ?? "",
-        "attendees": attendees,
+        "attendees": (event.attendees ?? []).compactMap { $0.name },
+        "participants": participants,
         "starts_in_seconds": Int(event.startDate.timeIntervalSince(now)),
         "in_progress": event.startDate <= now && event.endDate >= now,
     ])
@@ -678,16 +817,37 @@ func callLabel(_ process: AudioProcess) -> String {
     return name.contains(".") ? String(name.split(separator: ".").last ?? "a call") : name
 }
 
+func isMeetnote(_ process: AudioProcess) -> Bool {
+    process.bundleID.hasPrefix("local.meetnote")
+        || (processName(for: process.pid) ?? "").hasPrefix("meetnote")
+}
+
+/// An iOS Simulator runs its own copies of the system daemons, call service
+/// included, and they share the Mac's audio hardware. A booted simulator's
+/// callservicesd plays output for as long as it runs and carries the same
+/// bundle ID as the Mac's, so without this it is a phone call that never ends.
+func isSimulated(_ process: AudioProcess) -> Bool {
+    (processPath(for: process.pid) ?? "").contains("/CoreSimulator/")
+}
+
 /// Polls for processes using the mic and speakers at once, emitting an event
 /// when that starts or stops. The app only ever *offers* to record — starting
 /// a recording without being asked would be the wrong default for a tool that
 /// listens to private meetings.
 func watchForCalls() -> Never {
     var active: pid_t?
+    // The app never sends a "stop": when it quits or crashes this process is
+    // reparented to launchd and would poll forever, so it leaves with it.
+    let parent = getppid()
     let timer = DispatchSource.makeTimerSource(queue: .main)
     timer.schedule(deadline: .now(), repeating: 2.0)
     timer.setEventHandler {
-        let candidate = listAudioProcesses().first { $0.looksLikeACall && $0.pid != getpid() }
+        if getppid() != parent { exit(0) }
+        // meetnote's own recorder opens the mic and taps the speakers, so while
+        // it runs it would look like a call that never ends.
+        let candidate = listAudioProcesses().first {
+            $0.looksLikeACall && $0.pid != getpid() && !isMeetnote($0) && !isSimulated($0)
+        }
         if let candidate, active != candidate.pid {
             active = candidate.pid
             emit([
@@ -819,6 +979,9 @@ final class CaptureSession: @unchecked Sendable {
                 "channels": Int(recorder.format.channelCount),
                 "frames": recorder.frameCount,
                 "duration_seconds": recorder.duration,
+                // Host-clock span of the stream, so a reader can check the
+                // header's rate against reality rather than trusting it.
+                "wall_seconds": recorder.wallSeconds ?? NSNull(),
                 "offset_seconds": offset,
                 "silent": recorder.isSilent,
                 "peak_dbfs": recorder.peakDbfs,
@@ -828,6 +991,10 @@ final class CaptureSession: @unchecked Sendable {
                 : "NO FRAMES AT ALL"
             note("  \(recorder.label.padding(toLength: 7, withPad: " ", startingAt: 0)): \(status)")
             if let error = recorder.writeError { note("           write error: \(error)") }
+            if let wall = recorder.wallSeconds, wall > 5, abs(recorder.duration - wall) / wall > 0.05 {
+                note(String(format: "           WARNING: %.0fs of audio over %.0fs of wall clock — the header's "
+                            + "%d Hz is wrong", recorder.duration, wall, Int(recorder.format.sampleRate)))
+            }
         }
 
         // Headers first: the metadata below describes files that must already
@@ -891,6 +1058,8 @@ func usage() -> Never {
       --json            emit newline-delimited JSON events on stdout, for the app
       --watch-calls     watch for meetings starting and stopping; record nothing
       --calendar        report the calendar event happening now, then exit
+      --at EPOCH        with --calendar: the event happening at that time instead
+      --no-ask          with --calendar: never show the permission prompt
       --permissions     report which permissions are granted, then exit
       --list            list processes currently visible to Core Audio, then exit
 
@@ -910,6 +1079,8 @@ var jsonMode = false
 var watchCalls = false
 // One-shot: report the meeting happening now, record nothing.
 var calendarLookup = false
+var calendarAt: Date?
+var calendarMayAsk = true
 var arguments = Array(CommandLine.arguments.dropFirst())
 
 while !arguments.isEmpty {
@@ -935,6 +1106,11 @@ while !arguments.isEmpty {
         watchCalls = true
     case "--calendar":
         calendarLookup = true
+    case "--no-ask":
+        calendarMayAsk = false
+    case "--at":
+        guard !arguments.isEmpty, let value = Double(arguments.removeFirst()) else { usage() }
+        calendarAt = Date(timeIntervalSince1970: value)
     case "--permissions":
         reportPermissions()
     case "--no-mic":
@@ -955,7 +1131,7 @@ while !arguments.isEmpty {
 
 if calendarLookup {
     jsonMode = true
-    currentCalendarEvent()
+    currentCalendarEvent(at: calendarAt ?? Date(), mayAsk: calendarMayAsk)
 }
 
 if watchCalls {
